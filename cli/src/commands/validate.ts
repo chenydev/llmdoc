@@ -1,13 +1,14 @@
 import { loadWorkspace, validateWorkspace } from "../lib/workspace.js";
 import { formatIssues } from "../lib/format.js";
+import type { WorkspaceResolutionOptions } from "../types.js";
 
-interface ValidateOptions {
+interface ValidateOptions extends WorkspaceResolutionOptions {
   cwd: string;
   json?: boolean;
 }
 
 export function runValidate(options: ValidateOptions): { ok: boolean; output: unknown; exitCode: number } {
-  const workspace = loadWorkspace(options.cwd);
+  const workspace = loadWorkspace(options.cwd, options);
   const issues = validateWorkspace(workspace);
   const errors = issues.filter((issue) => issue.severity === "error");
   const warnings = issues.filter((issue) => issue.severity === "warning");

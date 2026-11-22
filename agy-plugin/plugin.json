@@ -1,0 +1,9 @@
+{
+  "name": "llmdoc",
+  "version": "4.0.0",
+  "description": "Persistent engineering context powered by the content-addressed llmdoc CLI and progressive MDX knowledge retrieval",
+  "author": "chenydev (forked from DJJ & Danniel)",
+  "homepage": "https://github.com/chenydev/llmdoc",
+  "repository": "https://github.com/chenydev/llmdoc",
+  "logo": "assets/logo.svg"
+}

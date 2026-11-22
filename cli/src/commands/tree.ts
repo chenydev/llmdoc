@@ -1,16 +1,16 @@
 import { paginate, paginationMetadata } from "../lib/pagination.js";
 import { loadWorkspace } from "../lib/workspace.js";
-import { OutputOptions } from "../types.js";
+import { OutputOptions, WorkspaceResolutionOptions } from "../types.js";
 import { formatPaginationSummary } from "../lib/format.js";
 import { estimateTokens } from "../lib/markdown.js";
 
-interface TreeOptions extends OutputOptions {
+interface TreeOptions extends OutputOptions, WorkspaceResolutionOptions {
   docs?: boolean;
   cwd: string;
 }
 
 export function runTree(options: TreeOptions): unknown {
-  const workspace = loadWorkspace(options.cwd);
+  const workspace = loadWorkspace(options.cwd, options);
 
   if (options.docs) {
     const result = paginate({
@@ -84,7 +84,7 @@ export function runTree(options: TreeOptions): unknown {
     lines.push(`    ${entry.topic.summary}`);
   }
   lines.push("", ...formatPaginationSummary(result));
-  lines.push("hint: use `npx @tokenroll/llmdoc tree --docs` to expand documents; use `... index --topic <t>` for metadata");
+  lines.push("hint: use `llmdoc tree --docs` to expand documents; use `llmdoc index --topic <t>` for metadata");
   return lines.join("\n");
 }
 

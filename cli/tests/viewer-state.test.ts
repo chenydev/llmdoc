@@ -44,9 +44,11 @@ describe("viewer state projection", () => {
         untrackedPaths: [],
         degradedReason: null
       },
+      trackingMode: "git-hybrid",
+      surfaceDigest: "sha256:test",
       impacts: [
-        { document: dirty, changedCommittedPaths: [], dirtyPaths: ["src/dirty.ts"], needsReviewBecauseOf: [] },
-        { document: impacted, changedCommittedPaths: ["src/impacted.ts"], dirtyPaths: [], needsReviewBecauseOf: [] }
+        { document: dirty, changedPaths: ["src/dirty.ts"], changedCommittedPaths: [], dirtyPaths: ["src/dirty.ts"], needsReviewBecauseOf: [] },
+        { document: impacted, changedPaths: ["src/impacted.ts"], changedCommittedPaths: ["src/impacted.ts"], dirtyPaths: [], needsReviewBecauseOf: [] }
       ],
       needsReview: [dirty, needsReview],
       dirtyDocuments: [dirty],
@@ -83,6 +85,8 @@ describe("viewer state projection", () => {
     ]);
     expect(state.baseline).toEqual({
       revision: "base",
+      surfaceDigest: null,
+      trackingMode: "git-hybrid",
       headRevision: "head",
       behindHead: 1,
       relevantBehindHead: 0,
@@ -129,7 +133,11 @@ function makeWorkspace(documents: ParsedDocument[]): WorkspaceData {
   return {
     rootDir: "/repo",
     llmdocDir: "/repo/llmdoc",
+    docsDirExternal: false,
+    codeRoots: [{ name: null, configuredPath: ".", absolutePath: "/repo" }],
     metaPath: "/repo/llmdoc/meta.json",
+    metaLocation: "tracked",
+    metaDisplayPath: "llmdoc/meta.json",
     documents,
     documentsByLlmdocPath,
     topics: new Map([["topic", topicDocuments]]),

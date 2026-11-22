@@ -65,18 +65,36 @@ if (marketplace) {
     if (!entry.policy?.authentication) errors.push(`${label}: 缺少 policy.authentication`);
   }
 }
+const agyPlugin = readJson("agy-plugin/plugin.json");
 const versionSurfaces = [
   ["package.json", rootPackage?.version],
   ["cli/package.json", cliPackage?.version],
   [".claude-plugin/plugin.json", readJson(".claude-plugin/plugin.json")?.version],
   [".claude-plugin/marketplace.json", claudeMarketplace?.plugins?.[0]?.version],
-  [".codex-plugin/plugin.json", plugin?.version]
+  [".codex-plugin/plugin.json", plugin?.version],
+  ["agy-plugin/plugin.json", agyPlugin?.version]
 ];
 const expectedVersion = cliPackage?.version;
 for (const [label, version] of versionSurfaces) {
   if (expectedVersion && version !== expectedVersion) {
     errors.push(`${label}: version ${version ?? "<missing>"} 与 cli/package.json ${expectedVersion} 不一致`);
   }
+}
+
+// 2b) Antigravity (agy) native plugin manifest, hooks.json, and hook bridge presence
+const agyHooks = readJson("agy-plugin/hooks.json");
+if (agyPlugin) {
+  if (!agyPlugin.name) errors.push("agy-plugin/plugin.json: 缺少 name");
+  if (!agyPlugin.description) errors.push("agy-plugin/plugin.json: 缺少 description");
+}
+if (agyHooks) {
+  const llmdocHook = agyHooks.llmdoc;
+  if (!llmdocHook || !Array.isArray(llmdocHook.SessionStart) || !Array.isArray(llmdocHook.PostInvocation)) {
+    errors.push("agy-plugin/hooks.json: 必须声明 llmdoc.SessionStart 与 llmdoc.PostInvocation");
+  }
+}
+if (!fs.existsSync(path.join(root, "agy-plugin/hooks/llmdoc-hook.py"))) {
+  errors.push("agy-plugin/hooks/llmdoc-hook.py: 缺少 agy hook 脚本");
 }
 
 // 3) Claude/Codex skills:每个 SKILL.md 的 YAML frontmatter 可解析且有 name + description
@@ -233,11 +251,10 @@ for (const name of ["investigator", "reflector", "recorder"]) {
   }
 }
 
-// 6) hooks.json:合法 JSON；npm alias 强制从 scoped registry package 解析 runtime，
-// 避免消费仓库中同名但缺少 bin 的本地/file dependency 遮蔽 hook CLI。
+// 6) hooks.json:合法 JSON；直接调用本地安装的 fork `llmdoc` CLI，不回退到上游 npm。
 const hooks = readJson("hooks/hooks.json");
 if (hooks) {
-  const runtime = "npx -y --package=@tokenroll/llmdoc-hook-runtime@npm:@tokenroll/llmdoc -- llmdoc hook";
+  const runtime = "llmdoc hook";
   const expectedCommands = new Set([
     `${runtime} session-start`,
     `${runtime} stop`,
@@ -250,7 +267,7 @@ if (hooks) {
     }
   }
   for (const missing of expectedCommands) {
-    errors.push(`hooks.json: 缺少防本地遮蔽的 hook runtime 命令: ${missing}`);
+    errors.push(`hooks.json: 缺少 hook runtime 命令: ${missing}`);
   }
 }
 

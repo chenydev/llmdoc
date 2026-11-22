@@ -1,12 +1,12 @@
 import { paginate, paginationMetadata } from "../lib/pagination.js";
 import { assertDocumentKind } from "../lib/doc-shape.js";
 import { loadWorkspace } from "../lib/workspace.js";
-import { OutputOptions } from "../types.js";
+import { OutputOptions, WorkspaceResolutionOptions } from "../types.js";
 import { formatPaginationSummary } from "../lib/format.js";
 import { SearchResult, searchDocuments } from "../lib/search.js";
 import { estimateTokens } from "../lib/markdown.js";
 
-interface SearchOptions extends OutputOptions {
+interface SearchOptions extends OutputOptions, WorkspaceResolutionOptions {
   cwd: string;
   query: string;
   topic?: string;
@@ -14,7 +14,7 @@ interface SearchOptions extends OutputOptions {
 }
 
 export function runSearch(options: SearchOptions): unknown {
-  const workspace = loadWorkspace(options.cwd);
+  const workspace = loadWorkspace(options.cwd, options);
   const kind = options.kind ? assertDocumentKind(options.kind) : undefined;
   const search = searchDocuments(workspace, options.query, {
     topic: options.topic,

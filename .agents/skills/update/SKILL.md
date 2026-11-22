@@ -6,16 +6,16 @@ argument-hint: '[summary] [--scope <topic|path...>] [--reflection [<candidate...
 
 # /llmdoc:update
 
-Use this command when repository changes require tracked `llmdoc/` knowledge to be verified or synchronized.
+Use this command when codebase changes require `llmdoc/` knowledge to be verified or synchronized. Works in Git repositories, non-Git directories, and multi-repo federated workspaces.
 
-Load the `llmdoc` skill before broad exploration. CLI commands below run as `npx -y @tokenroll/llmdoc <cmd>`.
+Load the `llmdoc` skill before broad exploration. Run CLI commands directly as `llmdoc <cmd>`.
 
 ## Authorization
 
 An explicit `/llmdoc:update` invocation authorizes this run to:
 
-- read repository state and existing llmdoc docs
-- write impacted `llmdoc/` documents and `llmdoc/meta.json`
+- read workspace state and existing llmdoc docs
+- write impacted `llmdoc/` documents and update the `meta.json` ledger via CLI
 - write temporary investigation reports under `.llmdoc-tmp/investigations/`
 - read and resolve declared reflection candidates under `.llmdoc-tmp/reflections/`
 
@@ -23,9 +23,8 @@ This command does not authorize source-code edits.
 
 ## Preconditions
 
-- `git status -- llmdoc/` must be clean before the first formal write.
-- Rollback means `git checkout -- llmdoc/` (plus deleting any newly created files under `llmdoc/`); never hand-edit files back.
-- If `validate` fails after writes and cannot be repaired in-run, roll back the doc write-set before reporting failure.
+- Before rewriting existing docs, record the original write-set (or rely on CLI transactions such as `mv`, which back up to `.llmdoc-tmp/txn/` and roll back automatically).
+- If `validate` fails after writes and cannot be repaired in-run, restore the touched `llmdoc/` files (and delete newly created docs) before reporting failure; never leave a broken knowledge surface behind.
 
 ## Workflow
 
@@ -36,7 +35,7 @@ This command does not authorize source-code edits.
 
 2. Gate reflection candidates before promotion.
    - Require a verifiable trigger, wrong assumption or action, root cause, preventive rule, scope, confidence, and existing-doc match.
-   - Verify repository claims against code, tests, or stable docs. User corrections prove intent, not repository facts.
+   - Verify workspace claims against code, tests, or stable docs. User corrections prove intent, not repository facts.
    - Reject transient tool failures, one-task preferences, and unverified speculation. Use `search` and targeted `show` to find an existing owner before creating a document.
 
 3. Choose the lightest sufficient path from delta plus any qualified candidates.
@@ -54,12 +53,10 @@ This command does not authorize source-code edits.
    - Scaffold brand-new docs with `new`; register docs that already exist as files with `adopt <path...>` — never hand-edit `meta.json` or recreate the file through `new`.
 
 5. Finalize.
-   - If document identities changed, read [Startup Configuration](../llmdoc/references/startup-config.md). `mv` syncs renames; sync manual merges or deletions before validation.
-   - Run `validate`; after mapping or boundary changes, also run the reference's scoped routing acceptance.
-   - If prose changed, run `commit -m "<message>"`, adding `--verified <path...>` for reviewed unchanged docs. If all stayed unchanged, run `commit --verified <path...>`. Full verification uses `--all`, never with `--verified`.
-   - `commit` validates, commits prose, refreshes fingerprints, and lands `meta.json` separately. Never reconstruct this sequence manually or `--amend` it.
-   - Dirty mapped source makes `commit` fail closed; commit or clean that source, then retry.
-   - After success, `N commits behind HEAD, metadata-only; knowledge clean` reflects the meta follow-up commit, not staleness.
+   - If document identities changed, read [Startup Configuration](../llmdoc/references/startup-config.md). `mv` rewrites renames without Git; sync manual merges/deletions before validation.
+   - Run `validate`; after mapping/boundary changes, also run scoped routing acceptance.
+   - Run `finalize --verified <path...>` (or `finalize --all` for full sync) to validate, record `llmdoc.meta/v4` digests, and clean orphan entries without Git.
+   - In Git repos, optionally run `commit -m "<message>" [--verified <path...> | --all]` to finalize and land docs + `meta.json` in one commit (add `--require-clean` to require committed source).
 
 6. Fold durable lessons into stable docs directly.
    - Put reusable cautions, invariants, and workflow fixes into the relevant architecture or guide docs.
@@ -68,14 +65,14 @@ This command does not authorize source-code edits.
 
 ## State Invariants
 
-- Full successful updates may advance the repository baseline.
-- Scoped updates must update only per-document fingerprints, not the global baseline.
+- Full successful updates (`--all`) advance the workspace baseline surface digest.
+- Scoped updates (`--verified`) update only per-document content digests, not the global baseline.
 - Update never changes convergence state. If growth requires convergence, finish update and ask once before running the separate prune workflow.
 
 ## Result Contract
 
-- `success`: the declared scope was semantically verified, any necessary prose changes were committed, and applicable revisions advanced.
-- `no_change`: the declared scope was already current, so neither prose nor revision state needed to change.
+- `success`: the declared scope was semantically verified, any necessary prose changes were written, and applicable content digests advanced via `finalize` (or optional `commit`).
+- `no_change`: the declared scope was already current, so neither prose nor digest state needed to change.
 - `dry_run`: the user asked for a dry run, or only status/delta/investigation/planning output was produced without writing `llmdoc/`; do not advance state.
 - `incomplete`: evidence was insufficient, user input is required, or the scope belongs to a different explicit maintenance workflow; roll back writes and do not advance state.
 - `failed`: update failed and doc writes were rolled back.
@@ -88,4 +85,4 @@ Always report:
 - each reflection candidate and its disposition (`promoted`, `already_covered`, `dismissed`, or `pending`)
 - the stable docs changed and the docs verified unchanged by `recorder`
 - routing classifications and checks when topology changed
-- the `commit` result — validate gate, fingerprint refresh, and the meta follow-up commit — or why finalization was skipped
+- the `finalize` (or optional `commit`) result — validate gate and content-digest refresh — or why finalization was skipped

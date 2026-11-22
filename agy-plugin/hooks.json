@@ -1,0 +1,19 @@
+{
+  "llmdoc": {
+    "enabled": true,
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "python3 ./hooks/llmdoc-hook.py SessionStart",
+        "timeout": 12
+      }
+    ],
+    "PostInvocation": [
+      {
+        "type": "command",
+        "command": "python3 ./hooks/llmdoc-hook.py PostInvocation",
+        "timeout": 10
+      }
+    ]
+  }
+}

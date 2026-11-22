@@ -425,38 +425,43 @@ code:
     expect(deltaJson.impacted.some((item) => item.path === "llmdoc/api-client/error-model.mdx")).toBe(true);
   });
 
-  test("fingerprint updates selected docs only, blocks dirty code, and all-mode advances baseline unless detached", async () => {
+  test("fingerprint updates selected docs only, enforces --require-clean on dirty code, and all-mode advances baseline", async () => {
     const rootDir = createFixture();
     writeRepoFile(rootDir, "src/api/retry.ts", "export function isRetryable() { return false; }\n");
     commitAll(rootDir, "retry update");
 
     const before = readMeta(rootDir);
     const partial = await runCli(["fingerprint", "--update", "api-client/retry-policy.mdx", "--json"], rootDir);
-    const partialJson = JSON.parse(partial.stdout) as { updated: string[]; baselineRevision: string };
+    const partialJson = JSON.parse(partial.stdout) as { updated: string[]; baselineRevision: string; baselineDigest: string };
     const afterPartial = readMeta(rootDir);
     expect(partialJson.updated).toEqual(["api-client/retry-policy.mdx"]);
-    expect(afterPartial.documents["api-client/retry-policy.mdx"].validatedRevision).not.toBe(
-      before.documents["api-client/retry-policy.mdx"].validatedRevision
-    );
-    expect(afterPartial.baseline.revision).toBe(before.baseline.revision);
+    expect(afterPartial.schema).toBe("llmdoc.meta/v4");
+    expect(afterPartial.documents["api-client/retry-policy.mdx"]!.codeDigest).toMatch(/^sha256:/);
+    expect(afterPartial.baseline.hintRevision).toBe(before.baseline.revision);
 
     writeRepoFile(rootDir, "src/api/errors.ts", "export const RETRYABLE = ['timeout', 'network'];\n");
-    const blocked = await runCli(["fingerprint", "--update", "api-client/error-model.mdx"], rootDir);
+    const blocked = await runCli(["fingerprint", "--require-clean", "--update", "api-client/error-model.mdx"], rootDir);
     expect(blocked.exitCode).toBe(1);
     expect(blocked.stdout).toContain("dirty");
 
     writeRepoFile(rootDir, "src/unmapped.ts", "export const UNMAPPED = true;\n");
-    const blockedAll = await runCli(["fingerprint", "--all"], rootDir);
+    const blockedAll = await runCli(["fingerprint", "--require-clean", "--all"], rootDir);
     expect(blockedAll.exitCode).toBe(1);
     expect(blockedAll.stdout).toContain("api-client/error-model.mdx");
 
+    // Default fingerprint (without --require-clean) allows advancing against current disk with a note.
+    const dirtyAllowed = await runCli(["fingerprint", "--update", "api-client/error-model.mdx"], rootDir);
+    expect(dirtyAllowed.exitCode).toBe(0);
+    expect(dirtyAllowed.stdout).toContain("uncommitted workspace changes");
+
     stageFile(rootDir, "src/api/errors.ts");
     commitAll(rootDir, "error update");
-    // 与任何文档 code.paths 无关的 untracked 文件不阻塞全量 fingerprint。
-    const all = await runCli(["fingerprint", "--all", "--json"], rootDir);
-    const allJson = JSON.parse(all.stdout) as { baselineRevision: string };
+    // 与任何文档 code.paths 无关的 untracked 文件不阻塞全量 fingerprint --require-clean。
+    const all = await runCli(["fingerprint", "--require-clean", "--all", "--json"], rootDir);
+    const allJson = JSON.parse(all.stdout) as { baselineRevision: string; baselineDigest: string };
     const afterAll = readMeta(rootDir);
-    expect(afterAll.baseline.revision).toBe(allJson.baselineRevision);
+    expect(afterAll.baseline.surfaceDigest).toBe(allJson.baselineDigest);
+    expect(afterAll.baseline.hintRevision).toBe(allJson.baselineRevision);
     fs.rmSync(path.join(rootDir, "src", "unmapped.ts"));
 
     // detached HEAD 指向真实 commit,允许推进;只有 merge/rebase/cherry-pick 中间态才阻塞。
@@ -1145,24 +1150,26 @@ code:
     }
   });
 
-  test("init-state seeds a null-revision ledger and refuses to overwrite", async () => {
+  test("init-state seeds a null-digest v4 ledger and refuses to overwrite", async () => {
     const rootDir = createFixture();
     fs.rmSync(path.join(rootDir, "llmdoc", "meta.json"));
 
     const seeded = await runCli(["--json", "init-state"], rootDir);
     expect(seeded.exitCode).toBe(0);
-    const payload = JSON.parse(seeded.stdout) as { status: string; documents: number; next: string };
+    const payload = JSON.parse(seeded.stdout) as { status: string; schema: string; documents: number; next: string };
     expect(payload.status).toBe("success");
+    expect(payload.schema).toBe("llmdoc.meta/v4");
     expect(payload.documents).toBe(4);
     const meta = readMeta(rootDir);
-    expect(meta.documents["api-client/retry-policy.mdx"].validatedRevision).toBeNull();
+    expect(meta.schema).toBe("llmdoc.meta/v4");
+    expect(meta.documents["api-client/retry-policy.mdx"]!.codeDigest).toBeNull();
 
     const refused = await runCli(["init-state"], rootDir);
     expect(refused.exitCode).toBe(1);
     expect(refused.stdout).toContain("already exists");
   });
 
-  test("commit finalizes llmdoc writes as docs+meta commits with fingerprints", async () => {
+  test("commit finalizes llmdoc writes as a single commit with content digests", async () => {
     const rootDir = createFixture();
     fs.appendFileSync(path.join(rootDir, "llmdoc", "api-client", "retry-policy.mdx"), "\n新增一段稳定知识。\n");
     // 用户 stage 的非 llmdoc 文件不得被卷入
@@ -1173,15 +1180,19 @@ code:
     expect(result.exitCode).toBe(0);
     const payload = JSON.parse(result.stdout) as { status: string; commits: string[]; updated: string[] };
     expect(payload.status).toBe("success");
-    expect(payload.commits).toHaveLength(2);
+    expect(payload.commits).toHaveLength(1);
     expect(payload.updated).toEqual(["api-client/retry-policy.mdx"]);
 
     const { spawnSync } = await import("node:child_process");
     const staged = spawnSync("git", ["diff", "--cached", "--name-only"], { cwd: rootDir, encoding: "utf8" }).stdout;
     expect(staged).toContain("src/unrelated.ts");
-    const lastTwo = spawnSync("git", ["log", "-2", "--name-only", "--pretty=%s"], { cwd: rootDir, encoding: "utf8" }).stdout;
-    expect(lastTwo).toContain("refresh fingerprints");
-    expect(lastTwo).not.toContain("src/unrelated.ts");
+    const lastCommitFiles = spawnSync("git", ["show", "--pretty=", "--name-only", "HEAD"], {
+      cwd: rootDir,
+      encoding: "utf8"
+    }).stdout;
+    expect(lastCommitFiles).toContain("llmdoc/api-client/retry-policy.mdx");
+    expect(lastCommitFiles).toContain("llmdoc/meta.json");
+    expect(lastCommitFiles).not.toContain("src/unrelated.ts");
 
     const again = await runCli(["commit"], rootDir);
     expect(again.exitCode).toBe(0);
@@ -1207,7 +1218,10 @@ code:
     expect(payload.status).toBe("success");
     expect(payload.commits).toHaveLength(1);
     expect(payload.updated).toEqual(["api-client/retry-policy.mdx"]);
-    expect(readMeta(rootDir).documents["api-client/retry-policy.mdx"].validatedRevision).toBe(verifiedRevision);
+    const meta = readMeta(rootDir);
+    expect(meta.schema).toBe("llmdoc.meta/v4");
+    expect(meta.documents["api-client/retry-policy.mdx"]!.codeDigest).toMatch(/^sha256:/);
+    expect(meta.documents["api-client/retry-policy.mdx"]!.hintRevision).toBe(verifiedRevision);
 
     const committedPaths = spawnSync("git", ["show", "--pretty=", "--name-only", "HEAD"], {
       cwd: rootDir,
@@ -1222,7 +1236,7 @@ code:
     expect(JSON.parse(again.stdout)).toEqual({ status: "no_change", commits: [], updated: [] });
   });
 
-  test("commit fingerprints the union of changed and explicitly verified documents", async () => {
+  test("commit fingerprints the union of changed and explicitly verified documents in a single commit", async () => {
     const rootDir = createFixture();
     fs.appendFileSync(path.join(rootDir, "llmdoc", "api-client", "error-model.mdx"), "\n补充错误边界。\n");
 
@@ -1232,14 +1246,15 @@ code:
     );
     expect(result.exitCode).toBe(0);
     const payload = JSON.parse(result.stdout) as { commits: string[]; updated: string[] };
-    expect(payload.commits).toHaveLength(2);
+    expect(payload.commits).toHaveLength(1);
     expect(payload.updated).toEqual(["api-client/error-model.mdx", "api-client/retry-policy.mdx"]);
     const meta = readMeta(rootDir);
-    expect(meta.documents["api-client/error-model.mdx"].validatedRevision).toBe(payload.commits[0]);
-    expect(meta.documents["api-client/retry-policy.mdx"].validatedRevision).toBe(payload.commits[0]);
+    expect(meta.schema).toBe("llmdoc.meta/v4");
+    expect(meta.documents["api-client/error-model.mdx"]!.codeDigest).toMatch(/^sha256:/);
+    expect(meta.documents["api-client/retry-policy.mdx"]!.codeDigest).toMatch(/^sha256:/);
   });
 
-  test("commit --all can advance stale revisions with a meta-only commit and then becomes a no-op", async () => {
+  test("commit --all can advance stale digests with a single commit and then becomes a no-op", async () => {
     const rootDir = createFixture();
     writeRepoFile(rootDir, "src/api/retry.ts", "export function isRetryable() { return false; }\n");
     commitAll(rootDir, "change retry behavior");
@@ -1253,21 +1268,24 @@ code:
       commits: string[];
       updated: string[];
       baselineAdvanced: boolean;
+      baselineDigest: string;
     };
     expect(payload.status).toBe("success");
     expect(payload.commits).toHaveLength(1);
     expect(payload.updated).toHaveLength(4);
     expect(payload.baselineAdvanced).toBe(true);
     const meta = readMeta(rootDir);
-    expect(meta.baseline.revision).toBe(verifiedRevision);
-    expect(Object.values(meta.documents).every((entry) => entry.validatedRevision === verifiedRevision)).toBe(true);
+    expect(meta.schema).toBe("llmdoc.meta/v4");
+    expect(meta.baseline.surfaceDigest).toBe(payload.baselineDigest);
+    expect(meta.baseline.hintRevision).toBe(verifiedRevision);
+    expect(Object.values(meta.documents).every((entry) => typeof entry.codeDigest === "string" && entry.codeDigest.startsWith("sha256:"))).toBe(true);
 
     const again = await runCli(["--json", "commit", "--all"], rootDir);
     expect(again.exitCode).toBe(0);
     expect(JSON.parse(again.stdout)).toEqual({ status: "no_change", commits: [], updated: [] });
   });
 
-  test("commit --verified rejects conflicts and invalid paths, and preflights even an otherwise current document", async () => {
+  test("commit --verified rejects conflicts and invalid paths, and --require-clean preflights dirty code", async () => {
     const rootDir = createFixture();
 
     const conflict = await runCli(["commit", "--all", "--verified", "api-client/retry-policy.mdx"], rootDir);
@@ -1279,7 +1297,7 @@ code:
     expect(missing.stdout).toContain("Document does not exist");
 
     fs.appendFileSync(path.join(rootDir, "src", "api", "retry.ts"), "// dirty change\n");
-    const blocked = await runCli(["commit", "--verified", "api-client/retry-policy.mdx"], rootDir);
+    const blocked = await runCli(["commit", "--require-clean", "--verified", "api-client/retry-policy.mdx"], rootDir);
     expect(blocked.exitCode).not.toBe(0);
     expect(blocked.stdout).toContain("Fingerprint preflight failed");
   });
@@ -1297,16 +1315,16 @@ code:
     // .llmdocignore 本身是 untracked 的,不在忽略清单里则会出现——把它也忽略掉不是默认行为
   });
 
-  test("commit fails closed before creating any commit when mapped source is dirty", async () => {
+  test("commit --require-clean fails closed before creating any commit when mapped source is dirty", async () => {
     const rootDir = createFixture();
-    // 被 code.paths 映射的源码保持未提交,llmdoc 写集有变更 → fingerprint 预检必须在任何 commit 前拒绝
+    // 被 code.paths 映射的源码保持未提交,llmdoc 写集有变更 → --require-clean 预检必须在任何 commit 前拒绝
     fs.appendFileSync(path.join(rootDir, "src", "api", "retry.ts"), "// dirty change\n");
     fs.appendFileSync(path.join(rootDir, "llmdoc", "api-client", "retry-policy.mdx"), "\n新增一段。\n");
 
     const { spawnSync } = await import("node:child_process");
     const headBefore = spawnSync("git", ["rev-parse", "HEAD"], { cwd: rootDir, encoding: "utf8" }).stdout.trim();
 
-    const result = await runCli(["commit", "--all", "-m", "repro: llmdoc partial commit"], rootDir);
+    const result = await runCli(["commit", "--require-clean", "--all", "-m", "repro: llmdoc partial commit"], rootDir);
     expect(result.exitCode).not.toBe(0);
     expect(result.stdout).toContain("no commit was created");
 

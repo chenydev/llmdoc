@@ -7,6 +7,7 @@ import { CliError } from "./errors.js";
 import { packageRootFromImport } from "./package-root.js";
 import { loadViewerState } from "./viewer-state.js";
 import { loadWorkspace } from "./workspace.js";
+import type { WorkspaceResolutionOptions } from "../types.js";
 
 interface StaticAsset {
   fileName: string;
@@ -25,7 +26,10 @@ const STATIC_ASSETS: ReadonlyMap<string, StaticAsset> = new Map([
 export type ViewerRequestHandler = (request: http.IncomingMessage, response: http.ServerResponse) => void;
 
 /** 创建只读、显式路由的本地 Viewer handler。不会把 URL 路径拼接进文件系统。 */
-export function createViewerRequestHandler(rootDir: string): ViewerRequestHandler {
+export function createViewerRequestHandler(
+  rootDir: string,
+  options?: Pick<WorkspaceResolutionOptions, "docsDir">
+): ViewerRequestHandler {
   const packageRoot = packageRootFromImport(import.meta.url);
   const assetsRoot = path.join(packageRoot, "assets");
 
@@ -52,12 +56,12 @@ export function createViewerRequestHandler(rootDir: string): ViewerRequestHandle
         return;
       }
       if (url.pathname === "/api/state") {
-        sendJson(response, 200, loadViewerState(rootDir), headOnly);
+        sendJson(response, 200, loadViewerState(rootDir, undefined, options), headOnly);
         return;
       }
       if (url.pathname === "/api/doc") {
         const docPath = url.searchParams.get("path") ?? "";
-        const workspace = loadWorkspace(rootDir);
+        const workspace = loadWorkspace(rootDir, options);
         // 仅按扫描产生的 canonical llmdocPath 查表，不接受任意文件系统路径。
         const document = workspace.documentsByLlmdocPath.get(docPath);
         if (!document) {

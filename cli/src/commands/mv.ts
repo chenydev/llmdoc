@@ -3,14 +3,15 @@ import path from "node:path";
 
 import { isDirectTopicDirectory, parseDocTargetShape, validateMoveTargetShape } from "../lib/doc-shape.js";
 import { CliError } from "../lib/errors.js";
-import { findProjectRoot, normalizeRepoRelativePath, repoPath, resolveInsideRoot } from "../lib/fs.js";
-import { gitMove, gitRestorePaths } from "../lib/git.js";
+import { findProjectRoot, normalizeRepoRelativePath } from "../lib/fs.js";
 import { MoveMapping, updateDocumentForMove, writeFileIfChanged } from "../lib/rewrite.js";
-import { loadWorkspace } from "../lib/workspace.js";
+import { LocalTransaction } from "../lib/txn.js";
+import { loadWorkspace, resolveDocPathInWorkspace } from "../lib/workspace.js";
 import { LLMDOC_CONFIG_FILENAME, rewriteStartupPreloadForMove } from "../lib/config.js";
-import { MetaLedger, ParsedDocument } from "../types.js";
+import { writeMeta } from "../lib/state.js";
+import { MetaLedger, ParsedDocument, WorkspaceResolutionOptions } from "../types.js";
 
-interface MoveOptions {
+interface MoveOptions extends WorkspaceResolutionOptions {
   cwd: string;
   from: string;
   to: string;
@@ -18,10 +19,12 @@ interface MoveOptions {
 }
 
 export function runMove(options: MoveOptions): unknown {
-  const rootDir = findProjectRoot(options.cwd);
+  const rootDir = findProjectRoot(options.cwd, options);
+  const beforeWorkspace = loadWorkspace(rootDir, options);
+
   const fromRepoPath = normalizeRepoRelativePath(options.from.startsWith("llmdoc/") ? options.from : `llmdoc/${options.from}`);
   const toRepoPath = normalizeRepoRelativePath(options.to.startsWith("llmdoc/") ? options.to : `llmdoc/${options.to}`);
-  const fromAbsolutePath = resolveInsideRoot(rootDir, fromRepoPath);
+  const fromAbsolutePath = resolveDocPathInWorkspace(beforeWorkspace.llmdocDir, fromRepoPath);
 
   if (!fromRepoPath.startsWith("llmdoc/") || !toRepoPath.startsWith("llmdoc/")) {
     throw new CliError("mv supports moves only within llmdoc/.");
@@ -31,7 +34,6 @@ export function runMove(options: MoveOptions): unknown {
   }
 
   const fromStats = fs.statSync(fromAbsolutePath);
-  const beforeWorkspace = loadWorkspace(rootDir);
   if (fromStats.isDirectory()) {
     if (!isDirectTopicDirectory(fromRepoPath) || !isDirectTopicDirectory(toRepoPath)) {
       throw new CliError("Topic renames must use llmdoc/<topic> -> llmdoc/<topic>.");
@@ -48,7 +50,7 @@ export function runMove(options: MoveOptions): unknown {
     validateMoveTargetShape(targetShape);
   }
 
-  const toAbsolutePath = resolveInsideRoot(rootDir, toRepoPath, { allowMissing: true });
+  const toAbsolutePath = resolveDocPathInWorkspace(beforeWorkspace.llmdocDir, toRepoPath, { allowMissing: true });
   if (fs.existsSync(toAbsolutePath)) {
     throw new CliError(`Target already exists: ${toRepoPath}`);
   }
@@ -58,52 +60,63 @@ export function runMove(options: MoveOptions): unknown {
     ? rewriteStartupPreloadForMove(beforeWorkspace.llmdocConfig.config, mapping)
     : { config: null, changed: false };
   const configPath = path.join(rootDir, LLMDOC_CONFIG_FILENAME);
-  const originalConfig = configRewrite.changed ? fs.readFileSync(configPath, "utf8") : null;
-  // 目标 topic 目录不存在时自动创建(topic 即纯目录,没有入口节点前置要求)。
-  fs.mkdirSync(path.dirname(toAbsolutePath), { recursive: true });
-  gitMove(rootDir, fromRepoPath, toRepoPath);
 
   const movedAfterPaths = new Map<string, string>();
   for (const item of mapping) {
     movedAfterPaths.set(item.oldLlmdocPath, path.join(beforeWorkspace.llmdocDir, item.newLlmdocPath));
   }
 
-  const documentTargets = new Set<string>();
-  for (const document of beforeWorkspace.documents) {
-    if (documentTouchesMove(document, mapping)) {
-      documentTargets.add(document.absolutePath);
-    }
+  const touchedDocs = beforeWorkspace.documents.filter((document) => documentTouchesMove(document, mapping));
+  const rewrittenDisplayPaths = new Set<string>();
+  for (const document of touchedDocs) {
+    const movedTarget = mapping.find((item) => item.oldLlmdocPath === document.llmdocPath);
+    rewrittenDisplayPaths.add(`llmdoc/${movedTarget ? movedTarget.newLlmdocPath : document.llmdocPath}`);
   }
-  for (const nextAbsolute of movedAfterPaths.values()) {
-    documentTargets.add(nextAbsolute);
+  for (const item of mapping) {
+    rewrittenDisplayPaths.add(`llmdoc/${item.newLlmdocPath}`);
   }
 
+  // Git-free local filesystem transaction with `.llmdoc-tmp/txn/<id>/` backup & rollback.
+  const txn = new LocalTransaction(rootDir);
   try {
-    for (const document of beforeWorkspace.documents) {
-      if (!documentTouchesMove(document, mapping)) {
-        continue;
-      }
+    // 1. Back up all files that will be modified before touching the workspace.
+    for (const document of touchedDocs) {
+      txn.backupFile(document.absolutePath);
+    }
+    if (beforeWorkspace.meta) {
+      txn.backupFile(beforeWorkspace.metaPath);
+    }
+    if (configRewrite.changed) {
+      txn.backupFile(configPath);
+    }
 
+    // 2. Move the file or topic directory directly via fs.renameSync (auto-creating target parent dir).
+    txn.movePath(fromAbsolutePath, toAbsolutePath);
+
+    // 3. Rewrite internal document links and relations.
+    for (const document of touchedDocs) {
       const nextAbsolute = movedAfterPaths.get(document.llmdocPath) ?? document.absolutePath;
       const nextContent = updateDocumentForMove(document, mapping);
       writeFileIfChanged(nextAbsolute, nextContent);
     }
 
-    const refreshedWorkspace = loadWorkspace(rootDir);
-    if (refreshedWorkspace.meta) {
-      const nextMeta = rewriteMeta(refreshedWorkspace.meta, mapping);
-      fs.writeFileSync(refreshedWorkspace.metaPath, `${JSON.stringify(nextMeta, null, 2)}\n`);
+    // 4. Rewrite ledger keys and optional startup preload config.
+    if (beforeWorkspace.meta) {
+      const nextMeta = rewriteMeta(beforeWorkspace.meta, mapping);
+      writeMeta(beforeWorkspace.metaPath, nextMeta);
     }
     if (configRewrite.changed && configRewrite.config) {
       fs.writeFileSync(configPath, `${JSON.stringify(configRewrite.config, null, 2)}\n`);
     }
+
+    txn.commit();
   } catch (error) {
-    const rolledBack = rollbackMove(rootDir, toAbsolutePath, configPath, originalConfig);
+    const rolledBack = txn.rollback();
     const reason = error instanceof Error ? error.message : String(error);
     throw new CliError(
       rolledBack
         ? `Reference rewriting failed during mv; llmdoc/ was rolled back to its previous state: ${reason}`
-        : `Reference rewriting failed during mv and automatic rollback did not complete. Inspect git status -- llmdoc/ llmdoc.config.json and recover manually: ${reason}`
+        : `Reference rewriting failed during mv and automatic rollback did not complete. Inspect ${txn.txnDir} and recover manually: ${reason}`
     );
   }
 
@@ -114,7 +127,7 @@ export function runMove(options: MoveOptions): unknown {
         to: toRepoPath
       },
       rewrittenConfig: configRewrite.changed,
-      rewrittenDocuments: [...documentTargets].map((absolutePath) => repoPath(rootDir, absolutePath)).sort()
+      rewrittenDocuments: [...rewrittenDisplayPaths].sort()
     };
   }
   return `moved: ${fromRepoPath} -> ${toRepoPath}${configRewrite.changed ? "; updated llmdoc.config.json startup preload" : ""}`;
@@ -127,8 +140,6 @@ function buildMoveMapping(
   toAbsolutePath: string
 ): MoveMapping[] {
   const mapping: MoveMapping[] = [];
-  // llmdocDir 与待映射路径可能一边是 realpath 一边不是(如 macOS 的 /tmp symlink),
-  // 因此对两种 base 都尝试求相对路径。
   const llmdocDirBases = [...new Set([llmdocDir, fs.realpathSync(llmdocDir)])];
   const toLlmdocPath = (absolutePath: string): string => {
     for (const base of llmdocDirBases) {
@@ -163,19 +174,6 @@ function buildMoveMapping(
   return mapping.sort((left, right) => right.oldLlmdocPath.length - left.oldLlmdocPath.length);
 }
 
-function rollbackMove(rootDir: string, toAbsolutePath: string, configPath: string, originalConfig: string | null): boolean {
-  try {
-    fs.rmSync(toAbsolutePath, { recursive: true, force: true });
-    gitRestorePaths(rootDir, ["llmdoc"]);
-    if (originalConfig !== null) {
-      fs.writeFileSync(configPath, originalConfig);
-    }
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function documentTouchesMove(document: ParsedDocument, mapping: MoveMapping[]): boolean {
   if (mapping.some((item) => document.llmdocPath === item.oldLlmdocPath)) {
     return true;
@@ -196,10 +194,19 @@ function documentTouchesMove(document: ParsedDocument, mapping: MoveMapping[]): 
 }
 
 function rewriteMeta(meta: MetaLedger, mapping: MoveMapping[]): MetaLedger {
-  const nextDocuments: MetaLedger["documents"] = {};
+  if (meta.schema === "llmdoc.meta/v4") {
+    const nextDocuments: typeof meta.documents = {};
+    for (const [docPath, value] of Object.entries(meta.documents)) {
+      nextDocuments[rewritePath(docPath, mapping)] = value;
+    }
+    return {
+      ...meta,
+      documents: nextDocuments
+    };
+  }
+  const nextDocuments: typeof meta.documents = {};
   for (const [docPath, value] of Object.entries(meta.documents)) {
-    const rewrittenPath = rewritePath(docPath, mapping);
-    nextDocuments[rewrittenPath] = value;
+    nextDocuments[rewritePath(docPath, mapping)] = value;
   }
   return {
     ...meta,

@@ -1,16 +1,18 @@
 import { CliError } from "../lib/errors.js";
-import { updateMetaRevisions, writeMeta } from "../lib/state.js";
+import { getMetaBaselineRevision, persistMetaAndSnapshots, updateMetaDigests } from "../lib/state.js";
 import { loadWorkspace } from "../lib/workspace.js";
+import type { WorkspaceResolutionOptions } from "../types.js";
 
-interface FingerprintOptions {
+interface FingerprintOptions extends WorkspaceResolutionOptions {
   cwd: string;
   json?: boolean;
   update?: string[];
   all?: boolean;
+  requireClean?: boolean;
 }
 
 export function runFingerprint(options: FingerprintOptions): unknown {
-  const workspace = loadWorkspace(options.cwd);
+  const workspace = loadWorkspace(options.cwd, options);
   const targetPaths = options.update?.map((value) => (value.startsWith("llmdoc/") ? value.slice("llmdoc/".length) : value)) ?? [];
 
   if (options.all && targetPaths.length > 0) {
@@ -28,22 +30,43 @@ export function runFingerprint(options: FingerprintOptions): unknown {
   }
 
   try {
-    const result = updateMetaRevisions({
+    const result = updateMetaDigests({
       workspace,
       llmdocPaths: targetPaths,
-      updateAll: Boolean(options.all)
+      updateAll: Boolean(options.all),
+      requireClean: Boolean(options.requireClean)
     });
-    writeMeta(workspace.metaPath, result.meta);
+    persistMetaAndSnapshots({
+      workspace,
+      meta: result.meta,
+      surface: result.surface,
+      updatedDocPaths: result.updatedPaths,
+      advanceBaseline: Boolean(options.all)
+    });
+
+    const baselineDigest = result.meta.baseline.surfaceDigest;
+    const baselineRevision = getMetaBaselineRevision(result.meta);
 
     if (options.json) {
       return {
         status: "success",
         updateAll: Boolean(options.all),
         updated: result.updatedPaths,
-        baselineRevision: result.meta.baseline.revision
+        baselineDigest,
+        baselineRevision,
+        ...(result.dirtyPaths.length > 0 ? { dirtyPaths: result.dirtyPaths } : {})
       };
     }
-    return `fingerprint: updated ${result.updatedPaths.length} document(s)${options.all ? ` and baseline -> ${result.meta.baseline.revision}` : ""}`;
+
+    const lines = [
+      `fingerprint: updated ${result.updatedPaths.length} document(s)${
+        options.all ? ` and baseline -> ${baselineDigest?.slice(0, 19) ?? baselineRevision ?? "updated"}` : ""
+      }`
+    ];
+    if (result.dirtyPaths.length > 0) {
+      lines.push(`note: fingerprinted against uncommitted workspace changes (${result.dirtyPaths.length} file(s))`);
+    }
+    return lines.join("\n");
   } catch (error) {
     throw new CliError((error as Error).message);
   }

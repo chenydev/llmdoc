@@ -1,10 +1,18 @@
 import fs from "node:fs";
 
-import { DocumentImpact, GitState, MetaLedger, ParsedDocument, WorkspaceData } from "../types.js";
-import { canAdvanceRevisions, gitCommitExists, readChangedPathsSince, readGitState } from "./git.js";
-import { normalizeRepoRelativePath } from "./fs.js";
+import { DocumentImpact, GitState, MetaLedger, MetaLedgerV4, ParsedDocument, WorkspaceData } from "../types.js";
+import { canAdvanceRevisions, gitCommitExists, readChangedPathsSince, readGitState, readGitTreeBlobHashes } from "./git.js";
+import { ensureDirectory, normalizeRepoRelativePath } from "./fs.js";
+import { createIgnoreEngine, IgnoreEngine } from "./ignore.js";
 import { matchesCodePathPattern } from "./search.js";
-import { LLMDOC_CONFIG_FILENAME } from "./config.js";
+import {
+  computeCodeDigest,
+  computeDocumentCodeDigest,
+  diffFileMaps,
+  saveSurfaceSnapshots,
+  scanWorkspaceSurface,
+  type WorkspaceSurface
+} from "./surface.js";
 
 export interface ScopeFilter {
   topics: Set<string>;
@@ -13,6 +21,8 @@ export interface ScopeFilter {
 
 export interface DeltaState {
   git: GitState;
+  trackingMode: "git-hybrid" | "filesystem";
+  surfaceDigest: string;
   impacts: DocumentImpact[];
   needsReview: ParsedDocument[];
   dirtyDocuments: ParsedDocument[];
@@ -33,13 +43,237 @@ export interface GrowthState {
   exceedsGate: boolean;
 }
 
+export function getMetaBaselineRevision(meta: MetaLedger | null): string | null {
+  if (!meta) {
+    return null;
+  }
+  return meta.schema === "llmdoc.meta/v4" ? (meta.baseline.hintRevision ?? null) : meta.baseline.revision;
+}
+
+export function getMetaBaselineDigest(meta: MetaLedger | null): string | null {
+  if (!meta || meta.schema !== "llmdoc.meta/v4") {
+    return null;
+  }
+  return meta.baseline.surfaceDigest;
+}
+
 export function analyzeDelta(workspace: WorkspaceData, scope?: ScopeFilter): DeltaState {
+  const isV3 = workspace.meta?.schema === "llmdoc.meta/v3";
   const git = readWorkspaceGitState(workspace);
-  const ignorePatterns = loadIgnorePatterns(workspace.rootDir);
-  const isSurface = (repoRelativePath: string): boolean => isImplementationSurfacePath(repoRelativePath, ignorePatterns);
+  const surface = scanWorkspaceSurface(workspace);
+  const ignoreEngine = createIgnoreEngine(workspace.rootDir, { llmdocDir: workspace.llmdocDir });
   const scopedDocuments = applyScope(workspace.documents, scope);
+
+  if (isV3 && workspace.meta?.schema === "llmdoc.meta/v3") {
+    return analyzeLegacyV3Delta(workspace, scopedDocuments, git, surface, ignoreEngine);
+  }
+
+  return analyzeV4Delta(workspace, scopedDocuments, git, surface, ignoreEngine);
+}
+
+function analyzeV4Delta(
+  workspace: WorkspaceData,
+  scopedDocuments: ParsedDocument[],
+  git: GitState,
+  surface: WorkspaceSurface,
+  ignoreEngine: IgnoreEngine
+): DeltaState {
+  const meta = workspace.meta?.schema === "llmdoc.meta/v4" ? workspace.meta : null;
+  const unverifiedReasons: string[] = [];
+  const treeCache = new Map<string, Map<string, string> | null>();
+
+  const getHistoricalTree = (revision: string): Map<string, string> | null => {
+    if (treeCache.has(revision)) {
+      return treeCache.get(revision)!;
+    }
+    const tree = git.available ? readGitTreeBlobHashes(workspace.rootDir, revision) : null;
+    treeCache.set(revision, tree);
+    return tree;
+  };
+
+  const directImpacts: DocumentImpact[] = scopedDocuments
+    .map((document): DocumentImpact => {
+      const entry = meta?.documents[document.llmdocPath];
+      const { matchedFiles, codeDigest: currentDigest } = computeDocumentCodeDigest(document, surface.files);
+
+      if (!entry || entry.codeDigest === null) {
+        unverifiedReasons.push(`Document ${document.llmdocPath} has no verified codeDigest`);
+        const matchedList = Object.keys(matchedFiles).sort();
+        const dirtyPaths = matchedList.filter((filePath) => surface.dirtyPaths.has(filePath));
+        return {
+          document,
+          changedPaths: [],
+          changedCommittedPaths: [],
+          dirtyPaths,
+          needsReviewBecauseOf: ["codeDigest unverified"]
+        };
+      }
+
+      if (entry.codeDigest === currentDigest) {
+        return {
+          document,
+          changedPaths: [],
+          changedCommittedPaths: [],
+          dirtyPaths: [],
+          needsReviewBecauseOf: []
+        };
+      }
+
+      // Content digest changed: resolve exact changed files from local snapshot cache,
+      // falling back to optional Git hintRevision tree, or listing matched paths.
+      let changedPaths: string[] = [];
+      const cachedDocSnapshot = surface.cache.documentSnapshots?.[document.llmdocPath];
+      if (cachedDocSnapshot && cachedDocSnapshot.codeDigest === entry.codeDigest) {
+        changedPaths = diffFileMaps(cachedDocSnapshot.files, matchedFiles);
+      } else if (entry.hintRevision) {
+        const tree = getHistoricalTree(entry.hintRevision);
+        if (tree) {
+          const prevMatched: Record<string, string> = {};
+          for (const [relPath, hash] of tree) {
+            if (ignoreEngine.isImplementationSurface(relPath) && documentMatchesPath(document, relPath)) {
+              prevMatched[relPath] = hash;
+            }
+          }
+          changedPaths = diffFileMaps(prevMatched, matchedFiles);
+        }
+      }
+
+      const needsReviewBecauseOf: string[] = [];
+      if (changedPaths.length === 0) {
+        changedPaths = Object.keys(matchedFiles).sort();
+        needsReviewBecauseOf.push("codeDigest changed");
+      }
+
+      const dirtyPaths = changedPaths.filter((filePath) => surface.dirtyPaths.has(filePath));
+      const changedCommittedPaths = changedPaths.filter((filePath) => !surface.dirtyPaths.has(filePath));
+
+      return {
+        document,
+        changedPaths,
+        changedCommittedPaths,
+        dirtyPaths,
+        needsReviewBecauseOf
+      };
+    })
+    .filter(
+      (impact) =>
+        impact.changedPaths.length > 0 ||
+        impact.changedCommittedPaths.length > 0 ||
+        impact.dirtyPaths.length > 0 ||
+        impact.needsReviewBecauseOf.length > 0
+    );
+
+  const { needsReview } = expandReverseRequires(workspace.documents, scopedDocuments, directImpacts);
+  const dirtyDocuments = directImpacts.filter((impact) => impact.dirtyPaths.length > 0).map((impact) => impact.document);
+
+  // Unmapped change detection (content-digest first: if surfaceDigest matches baseline, 0 unmapped!).
+  const { unmappedCommittedPaths, unmappedDirtyPaths } = computeV4UnmappedPaths(workspace, meta, git, surface, ignoreEngine);
+
+  const reasons: string[] = [];
+  if (!meta) {
+    reasons.push(`${workspace.metaDisplayPath} is missing`);
+  }
+  if (unverifiedReasons.length > 0) {
+    reasons.push(...unverifiedReasons);
+  }
+  if (unmappedCommittedPaths.length > 0 || unmappedDirtyPaths.length > 0) {
+    reasons.push("Unmapped code paths exist");
+  }
+  if (needsReview.length > 0) {
+    reasons.push("Documents in the reverse requires closure need review");
+  }
+  if (directImpacts.length > 8) {
+    reasons.push("Too many documents are impacted; deep mode is recommended");
+  }
+  if (dirtyDocuments.length > 0) {
+    reasons.push("Mapped implementation code has uncommitted changes");
+  }
+
+  return {
+    git,
+    trackingMode: surface.mode,
+    surfaceDigest: surface.surfaceDigest,
+    impacts: directImpacts.sort((left, right) => left.document.llmdocPath.localeCompare(right.document.llmdocPath)),
+    needsReview,
+    dirtyDocuments: dirtyDocuments.sort((left, right) => left.llmdocPath.localeCompare(right.llmdocPath)),
+    unmappedCommittedPaths,
+    unmappedDirtyPaths,
+    suggestedMode: reasons.length > 0 ? "deep" : "light",
+    reasons,
+    scopedDocuments
+  };
+}
+
+function computeV4UnmappedPaths(
+  workspace: WorkspaceData,
+  meta: MetaLedgerV4 | null,
+  git: GitState,
+  surface: WorkspaceSurface,
+  ignoreEngine: IgnoreEngine
+): { unmappedCommittedPaths: string[]; unmappedDirtyPaths: string[] } {
+  const baselineDigest = meta?.baseline.surfaceDigest ?? null;
+  if (baselineDigest !== null && baselineDigest === surface.surfaceDigest) {
+    // Byte-for-byte identical implementation surface -> zero unmapped changes (immune to rebase/squash/amend).
+    return { unmappedCommittedPaths: [], unmappedDirtyPaths: [] };
+  }
+
+  const isUnmapped = (relPath: string): boolean =>
+    !workspace.documents.some((document) => documentMatchesPath(document, relPath));
+
+  // 1. Primary path: diff against local baseline snapshot cache (works identically for Git & non-Git).
+  const baselineSnap = surface.cache.baselineSnapshot;
+  if (baselineSnap && baselineDigest !== null && baselineSnap.surfaceDigest === baselineDigest) {
+    const changed = diffFileMaps(baselineSnap.files, surface.files).filter((relPath) => surface.files.has(relPath));
+    const unmapped = changed.filter(isUnmapped);
+    return {
+      unmappedCommittedPaths: unmapped.filter((filePath) => !surface.dirtyPaths.has(filePath)),
+      unmappedDirtyPaths: unmapped.filter((filePath) => surface.dirtyPaths.has(filePath))
+    };
+  }
+
+  // 2. Cold-start fallback in Git repository when hintRevision is reachable.
+  const hintRevision = meta?.baseline.hintRevision ?? null;
+  if (git.available && hintRevision && git.headRevision && gitCommitExists(workspace.rootDir, hintRevision)) {
+    const committed = git.committedChangedPaths.filter(
+      (filePath) => ignoreEngine.isImplementationSurface(filePath) && surface.files.has(filePath) && isUnmapped(filePath)
+    );
+    const dirty = [...surface.dirtyPaths].filter((filePath) => surface.files.has(filePath) && isUnmapped(filePath));
+    return {
+      unmappedCommittedPaths: uniquePaths(committed),
+      unmappedDirtyPaths: uniquePaths(dirty)
+    };
+  }
+
+  // 3. Git working-tree dirty fallback (e.g. unborn branch or missing/rebased hintRevision without local cache).
+  if (git.available && surface.dirtyPaths.size > 0) {
+    const dirty = [...surface.dirtyPaths].filter((filePath) => surface.files.has(filePath) && isUnmapped(filePath));
+    return {
+      unmappedCommittedPaths: [],
+      unmappedDirtyPaths: uniquePaths(dirty)
+    };
+  }
+
+  // 4. Cold-start non-Git without baselineSnapshot when digest differs from baseline.
+  if (baselineDigest !== null && baselineDigest !== surface.surfaceDigest) {
+    const unmapped = [...surface.files.keys()].filter(isUnmapped);
+    return {
+      unmappedCommittedPaths: uniquePaths(unmapped),
+      unmappedDirtyPaths: []
+    };
+  }
+
+  return { unmappedCommittedPaths: [], unmappedDirtyPaths: [] };
+}
+
+function analyzeLegacyV3Delta(
+  workspace: WorkspaceData,
+  scopedDocuments: ParsedDocument[],
+  git: GitState,
+  surface: WorkspaceSurface,
+  ignoreEngine: IgnoreEngine
+): DeltaState {
+  const isSurface = (repoRelativePath: string): boolean => ignoreEngine.isImplementationSurface(repoRelativePath);
   const dirtyPaths = uniquePaths([...git.stagedPaths, ...git.unstagedPaths, ...git.untrackedPaths].filter(isSurface));
-  const invalidRevisionDocuments: ParsedDocument[] = [];
   const invalidRevisionReasons: string[] = [];
   const changedPathsByRevision = new Map<string, string[]>();
   const commitExistsByRevision = new Map<string, boolean>();
@@ -48,20 +282,18 @@ export function analyzeDelta(workspace: WorkspaceData, scope?: ScopeFilter): Del
     if (cached !== undefined) {
       return cached;
     }
-    const exists = gitCommitExists(workspace.rootDir, revision);
+    const exists = git.available && gitCommitExists(workspace.rootDir, revision);
     commitExistsByRevision.set(revision, exists);
     return exists;
   };
 
+  const metaV3 = workspace.meta?.schema === "llmdoc.meta/v3" ? workspace.meta : null;
+
   const directImpacts: DocumentImpact[] = scopedDocuments
     .map((document): DocumentImpact => {
-      const validatedRevision = workspace.meta?.documents[document.llmdocPath]?.validatedRevision ?? null;
-      const revisionInvalid =
-        !validatedRevision ||
-        !git.headRevision ||
-        !cachedCommitExists(validatedRevision);
+      const validatedRevision = metaV3?.documents[document.llmdocPath]?.validatedRevision ?? null;
+      const revisionInvalid = !validatedRevision || !git.headRevision || !cachedCommitExists(validatedRevision);
       if (revisionInvalid) {
-        invalidRevisionDocuments.push(document);
         invalidRevisionReasons.push(
           !validatedRevision
             ? `Document ${document.llmdocPath} has no validatedRevision`
@@ -77,6 +309,7 @@ export function analyzeDelta(workspace: WorkspaceData, scope?: ScopeFilter): Del
       const dirtyDocumentPaths = dirtyPaths.filter((filePath) => documentMatchesPath(document, filePath));
       return {
         document,
+        changedPaths: uniquePaths([...changedCommittedPaths, ...dirtyDocumentPaths]),
         changedCommittedPaths,
         dirtyPaths: dirtyDocumentPaths,
         needsReviewBecauseOf: revisionInvalid ? ["validatedRevision invalid"] : []
@@ -89,26 +322,7 @@ export function analyzeDelta(workspace: WorkspaceData, scope?: ScopeFilter): Del
         impact.needsReviewBecauseOf.includes("validatedRevision invalid")
     );
 
-  const directMap = new Map(directImpacts.map((impact) => [impact.document.llmdocPath, impact]));
-  const reverseRequires = buildReverseRequires(workspace.documents);
-  const needsReviewMap = new Map<string, ParsedDocument>();
-
-  for (const impact of directImpacts) {
-    for (const dependent of reverseRequires.get(impact.document.llmdocPath) ?? []) {
-      if (!scopedDocuments.some((document) => document.llmdocPath === dependent.llmdocPath)) {
-        continue;
-      }
-      if (!directMap.has(dependent.llmdocPath)) {
-        needsReviewMap.set(dependent.llmdocPath, dependent);
-      }
-      const existing = directMap.get(dependent.llmdocPath);
-      if (existing) {
-        existing.needsReviewBecauseOf.push(impact.document.llmdocPath);
-      }
-    }
-  }
-
-  const needsReview = [...needsReviewMap.values()].sort((left, right) => left.llmdocPath.localeCompare(right.llmdocPath));
+  const { needsReview } = expandReverseRequires(workspace.documents, scopedDocuments, directImpacts);
   const dirtyDocuments = directImpacts.filter((impact) => impact.dirtyPaths.length > 0).map((impact) => impact.document);
   const baselineCommittedPaths = git.committedChangedPaths.filter(isSurface);
   const unmappedCommittedPaths = baselineCommittedPaths.filter(
@@ -137,23 +351,54 @@ export function analyzeDelta(workspace: WorkspaceData, scope?: ScopeFilter): Del
   if (dirtyDocuments.length > 0) {
     reasons.push("Mapped implementation code has uncommitted changes");
   }
-  const suggestedMode: "light" | "deep" = reasons.length > 0 ? "deep" : "light";
 
   return {
     git,
+    trackingMode: surface.mode,
+    surfaceDigest: surface.surfaceDigest,
     impacts: directImpacts.sort((left, right) => left.document.llmdocPath.localeCompare(right.document.llmdocPath)),
     needsReview,
     dirtyDocuments: dirtyDocuments.sort((left, right) => left.llmdocPath.localeCompare(right.llmdocPath)),
     unmappedCommittedPaths,
     unmappedDirtyPaths,
-    suggestedMode,
+    suggestedMode: reasons.length > 0 ? "deep" : "light",
     reasons,
     scopedDocuments
   };
 }
 
+function expandReverseRequires(
+  allDocuments: ParsedDocument[],
+  scopedDocuments: ParsedDocument[],
+  directImpacts: DocumentImpact[]
+): { needsReview: ParsedDocument[] } {
+  const directMap = new Map(directImpacts.map((impact) => [impact.document.llmdocPath, impact]));
+  const reverseRequires = buildReverseRequires(allDocuments);
+  const needsReviewMap = new Map<string, ParsedDocument>();
+
+  for (const impact of directImpacts) {
+    for (const dependent of reverseRequires.get(impact.document.llmdocPath) ?? []) {
+      if (!scopedDocuments.some((document) => document.llmdocPath === dependent.llmdocPath)) {
+        continue;
+      }
+      if (!directMap.has(dependent.llmdocPath)) {
+        needsReviewMap.set(dependent.llmdocPath, dependent);
+      }
+      const existing = directMap.get(dependent.llmdocPath);
+      if (existing) {
+        existing.needsReviewBecauseOf.push(impact.document.llmdocPath);
+      }
+    }
+  }
+
+  return {
+    needsReview: [...needsReviewMap.values()].sort((left, right) => left.llmdocPath.localeCompare(right.llmdocPath))
+  };
+}
+
 export function readWorkspaceGitState(workspace: WorkspaceData): GitState {
-  return readGitState(workspace.rootDir, workspace.meta?.baseline.revision ?? null);
+  const legacyStrict = workspace.meta?.schema === "llmdoc.meta/v3";
+  return readGitState(workspace.rootDir, getMetaBaselineRevision(workspace.meta), { legacyStrict });
 }
 
 export function parseScope(values: string[] | undefined, workspace: WorkspaceData): ScopeFilter | undefined {
@@ -200,16 +445,50 @@ export function computeGrowthState(workspace: WorkspaceData): GrowthState {
   };
 }
 
-// fingerprint 推进的全部前置条件(git 可推进 + 关联源码无 dirty),
-// 供 updateMetaRevisions 执行前使用,也供 commit 在创建任何 commit 前 preflight,失败时 fail-closed。
-export function assertRevisionAdvancePreconditions(input: {
+/**
+ * Creates a fresh `llmdoc.meta/v4` initial ledger (all docs start with `codeDigest: null`).
+ * Works identically in Git repos, unborn branches, and non-Git directories.
+ */
+export function createInitialMetaLedger(workspace: WorkspaceData): {
+  meta: MetaLedgerV4;
+  surface: WorkspaceSurface;
+  headRevision: string | null;
+} {
+  const git = readWorkspaceGitState(workspace);
+  const surface = scanWorkspaceSurface(workspace);
+  const now = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+  const meta: MetaLedgerV4 = {
+    schema: "llmdoc.meta/v4",
+    baseline: {
+      surfaceDigest: surface.surfaceDigest,
+      hintRevision: git.headRevision,
+      verifiedAt: now
+    },
+    documents: Object.fromEntries(
+      workspace.documents.map((document) => [
+        document.llmdocPath,
+        { codeDigest: null, hintRevision: null }
+      ])
+    ),
+    convergence: {
+      capturedAt: now,
+      source: "init",
+      documentCount: workspace.documents.length,
+      totalEstimatedTokens: workspace.documents.reduce((sum, document) => sum + document.estimatedTokens, 0)
+    }
+  };
+  return { meta, surface, headRevision: git.headRevision };
+}
+
+export function assertDigestAdvancePreconditions(input: {
   workspace: WorkspaceData;
   llmdocPaths: string[];
   updateAll: boolean;
-}): { git: GitState; targetPaths: string[] } {
-  const { workspace, llmdocPaths, updateAll } = input;
+  requireClean?: boolean;
+}): { git: GitState; surface: WorkspaceSurface; targetPaths: string[]; dirtyPaths: string[] } {
+  const { workspace, llmdocPaths, updateAll, requireClean = false } = input;
   if (!workspace.meta) {
-    throw new Error("meta.json is missing");
+    throw new Error(`${workspace.metaDisplayPath} is missing`);
   }
   const git = readWorkspaceGitState(workspace);
   const advance = canAdvanceRevisions(git);
@@ -217,57 +496,210 @@ export function assertRevisionAdvancePreconditions(input: {
     throw new Error(advance.reason);
   }
 
-  const targetPaths = updateAll ? workspace.documents.map((document) => document.llmdocPath) : llmdocPaths;
-  const ignorePatterns = loadIgnorePatterns(workspace.rootDir);
-  const dirtyPaths = uniquePaths([...git.stagedPaths, ...git.unstagedPaths, ...git.untrackedPaths]).filter((filePath) =>
-    isImplementationSurfacePath(filePath, ignorePatterns)
-  );
-  // 只有映射到某份文档 code.paths 的 dirty 变更才阻塞推进;
-  // 无关的 untracked/dirty 文件不影响 revision 的真实性,不应拦路。
-  const blocked = targetPaths.filter((docPath) => {
+  const surface = scanWorkspaceSurface(workspace);
+  const targetPaths = updateAll ? workspace.documents.map((document) => document.llmdocPath) : uniquePaths(llmdocPaths);
+
+  const dirtyMatchedFiles = new Set<string>();
+  const blockedDocs: string[] = [];
+  for (const docPath of targetPaths) {
     const document = workspace.documentsByLlmdocPath.get(docPath);
-    return document ? dirtyPaths.some((filePath) => documentMatchesPath(document, filePath)) : false;
-  });
-  if (blocked.length > 0) {
+    if (!document) {
+      continue;
+    }
+    const docDirty = [...surface.dirtyPaths].filter((filePath) => documentMatchesPath(document, filePath));
+    if (docDirty.length > 0) {
+      blockedDocs.push(docPath);
+      for (const filePath of docDirty) {
+        dirtyMatchedFiles.add(filePath);
+      }
+    }
+  }
+
+  if (requireClean && blockedDocs.length > 0) {
     throw new Error(
       updateAll
-        ? `A full fingerprint cannot advance while mapped code for these documents is dirty: ${blocked.join(", ")}`
-        : `Cannot advance revisions while mapped code for these documents is dirty: ${blocked.join(", ")}`
+        ? `A full fingerprint cannot advance while mapped code for these documents is dirty: ${blockedDocs.join(", ")}`
+        : `Cannot advance fingerprints while mapped code for these documents is dirty: ${blockedDocs.join(", ")}`
     );
   }
-  return { git, targetPaths };
+
+  return {
+    git,
+    surface,
+    targetPaths,
+    dirtyPaths: [...dirtyMatchedFiles].sort()
+  };
 }
 
-export function updateMetaRevisions(input: {
+/**
+ * Advances content digests (`llmdoc.meta/v4`) for selected or all documents,
+ * automatically upgrading legacy `llmdoc.meta/v3` ledgers losslessly.
+ */
+export function updateMetaDigests(input: {
   workspace: WorkspaceData;
   llmdocPaths: string[];
   updateAll: boolean;
-}): { meta: MetaLedger; updatedPaths: string[] } {
+  requireClean?: boolean;
+}): {
+  meta: MetaLedgerV4;
+  surface: WorkspaceSurface;
+  updatedPaths: string[];
+  removedOrphans: string[];
+  dirtyPaths: string[];
+  changed: boolean;
+} {
   const { workspace, updateAll } = input;
-  const { git, targetPaths } = assertRevisionAdvancePreconditions(input);
+  const { git, surface, targetPaths, dirtyPaths } = assertDigestAdvancePreconditions(input);
+  const existing = workspace.meta!;
+  const wasV3 = existing.schema === "llmdoc.meta/v3";
+  const nextMeta = migrateToV4Base(workspace, existing, git, surface);
 
-  const nextMeta: MetaLedger = structuredClone(workspace.meta!);
-  // 文档已被删除的孤儿 ledger 条目在此顺带清理:
-  // recorder 不允许手编辑 meta.json,删除文档后的 ledger 收敛只能由 CLI 完成。
+  const removedOrphans: string[] = [];
   for (const docPath of Object.keys(nextMeta.documents)) {
     if (!workspace.documentsByLlmdocPath.has(docPath)) {
       delete nextMeta.documents[docPath];
+      removedOrphans.push(docPath);
     }
   }
+  removedOrphans.sort();
+
+  const actuallyUpdated: string[] = [];
   for (const docPath of targetPaths) {
+    const document = workspace.documentsByLlmdocPath.get(docPath);
+    if (!document) {
+      continue;
+    }
+    const { codeDigest } = computeDocumentCodeDigest(document, surface.files);
+    const prev = nextMeta.documents[docPath];
+    const entryChanged = !prev || prev.codeDigest !== codeDigest || wasV3;
     nextMeta.documents[docPath] = {
-      validatedRevision: git.headRevision!
+      codeDigest,
+      hintRevision: git.headRevision
     };
+    if (entryChanged) {
+      actuallyUpdated.push(docPath);
+    }
   }
+
+  let baselineChanged = false;
   if (updateAll) {
-    nextMeta.baseline.revision = git.headRevision!;
-    nextMeta.baseline.verifiedAt = new Date().toISOString();
+    baselineChanged = wasV3 || nextMeta.baseline.surfaceDigest !== surface.surfaceDigest;
+    if (baselineChanged) {
+      nextMeta.baseline = {
+        surfaceDigest: surface.surfaceDigest,
+        hintRevision: git.headRevision,
+        verifiedAt: new Date().toISOString()
+      };
+    }
   }
-  return { meta: nextMeta, updatedPaths: targetPaths.slice().sort() };
+
+  const changed = wasV3 || removedOrphans.length > 0 || actuallyUpdated.length > 0 || baselineChanged;
+  return {
+    meta: nextMeta,
+    surface,
+    updatedPaths: targetPaths.slice().sort(),
+    removedOrphans,
+    dirtyPaths,
+    changed
+  };
+}
+
+export function persistMetaAndSnapshots(input: {
+  workspace: WorkspaceData;
+  meta: MetaLedgerV4;
+  surface: WorkspaceSurface;
+  updatedDocPaths: string[];
+  advanceBaseline: boolean;
+}): void {
+  writeMeta(input.workspace.metaPath, input.meta);
+  saveSurfaceSnapshots({
+    workspace: input.workspace,
+    surface: input.surface,
+    updatedDocPaths: input.updatedDocPaths,
+    advanceBaseline: input.advanceBaseline
+  });
 }
 
 export function writeMeta(metaPath: string, meta: MetaLedger): void {
+  ensureDirectory(metaPath);
   fs.writeFileSync(metaPath, `${JSON.stringify(meta, null, 2)}\n`);
+}
+
+export function isImplementationSurfacePath(rootDir: string, repoRelativePath: string, llmdocDir?: string): boolean {
+  return createIgnoreEngine(rootDir, { llmdocDir }).isImplementationSurface(repoRelativePath);
+}
+
+function migrateToV4Base(
+  workspace: WorkspaceData,
+  existing: MetaLedger,
+  git: GitState,
+  surface: WorkspaceSurface
+): MetaLedgerV4 {
+  if (existing.schema === "llmdoc.meta/v4") {
+    return structuredClone(existing);
+  }
+
+  // Losslessly convert legacy v3 entries using historical git tree blobs when reachable.
+  const ignoreEngine = createIgnoreEngine(workspace.rootDir, { llmdocDir: workspace.llmdocDir });
+  const treeCache = new Map<string, Map<string, string> | null>();
+  const getTree = (rev: string): Map<string, string> | null => {
+    if (treeCache.has(rev)) {
+      return treeCache.get(rev)!;
+    }
+    const tree = git.available ? readGitTreeBlobHashes(workspace.rootDir, rev) : null;
+    treeCache.set(rev, tree);
+    return tree;
+  };
+
+  let baselineDigest: string | null = null;
+  const baselineTree = getTree(existing.baseline.revision);
+  if (baselineTree) {
+    const surfaceEntries: Array<{ path: string; hash: string }> = [];
+    for (const [relPath, hash] of baselineTree) {
+      if (ignoreEngine.isImplementationSurface(relPath)) {
+        surfaceEntries.push({ path: relPath, hash });
+      }
+    }
+    baselineDigest = computeCodeDigest(surfaceEntries);
+  }
+
+  const nextDocs: MetaLedgerV4["documents"] = {};
+  for (const [docPath, entry] of Object.entries(existing.documents)) {
+    const doc = workspace.documentsByLlmdocPath.get(docPath);
+    if (!doc || !entry.validatedRevision) {
+      nextDocs[docPath] = { codeDigest: null, hintRevision: entry.validatedRevision };
+      continue;
+    }
+    const tree = getTree(entry.validatedRevision);
+    if (!tree) {
+      nextDocs[docPath] = { codeDigest: null, hintRevision: entry.validatedRevision };
+      continue;
+    }
+    const matched: Array<{ path: string; hash: string }> = [];
+    for (const [relPath, hash] of tree) {
+      if (ignoreEngine.isImplementationSurface(relPath) && documentMatchesPath(doc, relPath)) {
+        matched.push({ path: relPath, hash });
+      }
+    }
+    nextDocs[docPath] = {
+      codeDigest: computeCodeDigest(matched),
+      hintRevision: entry.validatedRevision
+    };
+  }
+
+  // Fallback if surface is empty and baselineTree couldn't be resolved.
+  void surface;
+
+  return {
+    schema: "llmdoc.meta/v4",
+    baseline: {
+      surfaceDigest: baselineDigest,
+      hintRevision: existing.baseline.revision,
+      verifiedAt: existing.baseline.verifiedAt
+    },
+    documents: nextDocs,
+    convergence: structuredClone(existing.convergence)
+  };
 }
 
 function applyScope(documents: ParsedDocument[], scope: ScopeFilter | undefined): ParsedDocument[] {
@@ -288,61 +720,6 @@ function documentMatchesPath(document: ParsedDocument, repoRelativePath: string)
 
 function uniquePaths(paths: string[]): string[] {
   return [...new Set(paths)].sort();
-}
-
-const NON_IMPLEMENTATION_BASENAMES = new Set([
-  ".gitignore",
-  ".gitattributes",
-  "package-lock.json",
-  "yarn.lock",
-  "pnpm-lock.yaml",
-  "bun.lockb",
-  "Cargo.lock",
-  "poetry.lock",
-  "uv.lock",
-  "composer.lock",
-  "Gemfile.lock",
-  "go.sum"
-]);
-
-const ignorePatternsCache = new Map<string, string[]>();
-
-// .llmdocignore:仓库根的可选文件,每行一个 minimatch pattern(# 开头为注释),
-// 匹配的路径不参与 unmapped/dirty 信号(本地运行时文件、生成物等非知识面路径)。
-export function loadIgnorePatterns(rootDir: string): string[] {
-  const cached = ignorePatternsCache.get(rootDir);
-  if (cached) {
-    return cached;
-  }
-  const ignoreFile = `${rootDir}/.llmdocignore`;
-  let patterns: string[] = [];
-  try {
-    patterns = fs
-      .readFileSync(ignoreFile, "utf8")
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter((line) => line && !line.startsWith("#"))
-      .map((line) => line.replace(/^\.\//, "").replace(/\/$/, "/**"));
-  } catch {
-    patterns = [];
-  }
-  ignorePatternsCache.set(rootDir, patterns);
-  return patterns;
-}
-
-export function isImplementationSurfacePath(repoRelativePath: string, ignorePatterns: string[] = []): boolean {
-  if (
-    repoRelativePath === LLMDOC_CONFIG_FILENAME ||
-    repoRelativePath.startsWith("llmdoc/") ||
-    repoRelativePath.startsWith(".llmdoc-tmp/")
-  ) {
-    return false;
-  }
-  const basename = repoRelativePath.split("/").pop() ?? repoRelativePath;
-  if (NON_IMPLEMENTATION_BASENAMES.has(basename)) {
-    return false;
-  }
-  return !ignorePatterns.some((pattern) => matchesCodePathPattern(pattern, repoRelativePath));
 }
 
 function buildReverseRequires(documents: ParsedDocument[]): Map<string, ParsedDocument[]> {

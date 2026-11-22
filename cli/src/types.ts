@@ -33,7 +33,7 @@ export interface ParsedDocument {
   lineCount: number;
 }
 
-export interface MetaLedger {
+export interface MetaLedgerV3 {
   schema: "llmdoc.meta/v3";
   baseline: {
     revision: string;
@@ -48,9 +48,55 @@ export interface MetaLedger {
   };
 }
 
+export interface MetaLedgerV4 {
+  schema: "llmdoc.meta/v4";
+  baseline: {
+    surfaceDigest: string | null;
+    hintRevision?: string | null;
+    verifiedAt: string;
+  };
+  documents: Record<
+    string,
+    {
+      codeDigest: string | null;
+      hintRevision?: string | null;
+    }
+  >;
+  convergence: {
+    capturedAt: string;
+    source: "init" | "prune";
+    documentCount: number;
+    totalEstimatedTokens: number;
+  };
+}
+
+export type MetaLedger = MetaLedgerV4 | MetaLedgerV3;
+
+export type CodeRootConfigEntry =
+  | string
+  | {
+      name: string;
+      path: string;
+    };
+
+export interface ResolvedCodeRoot {
+  /** Named prefix in code.paths (null when using the default workspace root). */
+  name: string | null;
+  /** Raw configured path (relative to rootDir or absolute). */
+  configuredPath: string;
+  /** Resolved canonical directory path on disk. */
+  absolutePath: string;
+}
+
 export interface LlmdocConfig {
   $schema?: string;
   schema: "llmdoc.config/v1";
+  docsDir?: string;
+  codeRoots?: CodeRootConfigEntry[];
+  state?: {
+    location?: "tracked" | "local";
+    localPath?: string;
+  };
   startup?: {
     remindSkill?: boolean;
     preload?: string[];
@@ -64,10 +110,19 @@ export interface LoadedLlmdocConfig {
   issues: ValidationIssue[];
 }
 
+export interface WorkspaceResolutionOptions {
+  root?: string;
+  docsDir?: string;
+}
+
 export interface WorkspaceData {
   rootDir: string;
   llmdocDir: string;
+  docsDirExternal: boolean;
+  codeRoots: ResolvedCodeRoot[];
   metaPath: string;
+  metaLocation: "tracked" | "local";
+  metaDisplayPath: string;
   documents: ParsedDocument[];
   documentsByLlmdocPath: Map<string, ParsedDocument>;
   topics: Map<string, ParsedDocument[]>;
@@ -115,6 +170,7 @@ export interface GitState {
 
 export interface DocumentImpact {
   document: ParsedDocument;
+  changedPaths: string[];
   changedCommittedPaths: string[];
   dirtyPaths: string[];
   needsReviewBecauseOf: string[];

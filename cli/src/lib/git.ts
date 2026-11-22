@@ -2,29 +2,22 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 
-import { CliError } from "./errors.js";
 import { GitState } from "../types.js";
 
-function runGit(rootDir: string, args: string[]): string {
-  const result = spawnSync("git", ["-c", "core.quotePath=false", ...args], {
-    cwd: rootDir,
-    encoding: "utf8"
-  });
-
-  if (result.status !== 0) {
-    throw new CliError((result.stderr || result.stdout || "Git command failed").trim());
+export function isDirectGitRoot(dirPath: string): boolean {
+  const resolved = path.resolve(dirPath);
+  if (!fs.existsSync(path.join(resolved, ".git"))) {
+    return false;
   }
-
-  return result.stdout.trim();
-}
-
-export function gitMove(rootDir: string, fromRepoPath: string, toRepoPath: string): void {
-  runGit(rootDir, ["mv", "--", fromRepoPath, toRepoPath]);
-}
-
-export function gitRestorePaths(rootDir: string, repoRelativePaths: string[]): void {
-  runGit(rootDir, ["reset", "--quiet", "--", ...repoRelativePaths]);
-  runGit(rootDir, ["checkout", "--quiet", "--", ...repoRelativePaths]);
+  const top = runGitSafe(resolved, ["rev-parse", "--show-toplevel"]);
+  if (!top) {
+    return false;
+  }
+  try {
+    return fs.realpathSync(top) === fs.realpathSync(resolved);
+  } catch {
+    return path.resolve(top) === resolved;
+  }
 }
 
 export function gitCommitExists(rootDir: string, revision: string): boolean {
@@ -47,8 +40,26 @@ export function isShallowRepository(rootDir: string): boolean {
   return runGitSafe(rootDir, ["rev-parse", "--is-shallow-repository"]) === "true";
 }
 
-export function readGitState(rootDir: string, baselineRevision: string | null): GitState {
-  if (!isGitRepository(rootDir)) {
+export function isGitRepository(rootDir: string): boolean {
+  const result = spawnSync("git", ["rev-parse", "--is-inside-work-tree"], {
+    cwd: rootDir,
+    encoding: "utf8"
+  });
+  return result.status === 0 && result.stdout.trim() === "true";
+}
+
+/**
+ * Reads optional Git state for a workspace root.
+ * When `legacyStrict` is false (v4 content-digest mode), non-Git directories,
+ * unborn branches, and missing/rebased hint revisions are NOT degraded errors.
+ */
+export function readGitState(
+  rootDir: string,
+  baselineRevision: string | null,
+  options?: { legacyStrict?: boolean }
+): GitState {
+  const legacyStrict = options?.legacyStrict ?? false;
+  if (!isDirectGitRoot(rootDir) && !isGitRepository(rootDir)) {
     return {
       available: false,
       headRevision: null,
@@ -59,14 +70,35 @@ export function readGitState(rootDir: string, baselineRevision: string | null): 
       stagedPaths: [],
       unstagedPaths: [],
       untrackedPaths: [],
-      degradedReason: "The current directory is not a Git repository; state diagnostics are unavailable."
+      degradedReason: legacyStrict
+        ? "The current directory is not a Git repository; state diagnostics are unavailable."
+        : null
+    };
+  }
+
+  // Only treat rootDir as a Git-backed workspace when rootDir itself is a direct Git root;
+  // federated multi-repo directories (rootDir has no .git, subdirs have .git) use pure FS mode.
+  if (!isDirectGitRoot(rootDir)) {
+    return {
+      available: false,
+      headRevision: null,
+      detached: false,
+      inProgressOperation: null,
+      baselineBehindHead: null,
+      committedChangedPaths: [],
+      stagedPaths: [],
+      unstagedPaths: [],
+      untrackedPaths: [],
+      degradedReason: null
     };
   }
 
   const headRevision = runGitSafe(rootDir, ["rev-parse", "--verify", "HEAD"]);
-  const detached = runGitSafe(rootDir, ["symbolic-ref", "--quiet", "--short", "HEAD"]) === null;
+  const detached = headRevision !== null && runGitSafe(rootDir, ["symbolic-ref", "--quiet", "--short", "HEAD"]) === null;
   const inProgressOperation = detectInProgressOperation(rootDir);
-  const stagedPaths = readPathList(rootDir, ["diff", "--name-only", "--no-renames", "--cached"]);
+  const stagedPaths = headRevision
+    ? readPathList(rootDir, ["diff", "--name-only", "--no-renames", "--cached"])
+    : readPathList(rootDir, ["ls-files", "--cached"]);
   const unstagedPaths = readPathList(rootDir, ["diff", "--name-only", "--no-renames"]);
   const untrackedPaths = readPathList(rootDir, ["ls-files", "--others", "--exclude-standard"]);
   const committedChangedPaths =
@@ -79,10 +111,12 @@ export function readGitState(rootDir: string, baselineRevision: string | null): 
       : null;
 
   let degradedReason: string | null = null;
-  if (!headRevision) {
-    degradedReason = isUnbornHead(rootDir) ? "HEAD has no commit (the current branch is unborn)." : "Unable to resolve the HEAD commit.";
-  } else if (baselineRevision && !gitCommitExists(rootDir, baselineRevision)) {
-    degradedReason = `baseline.revision does not exist in current Git history: ${baselineRevision}`;
+  if (legacyStrict) {
+    if (!headRevision) {
+      degradedReason = isUnbornHead(rootDir) ? "HEAD has no commit (the current branch is unborn)." : "Unable to resolve the HEAD commit.";
+    } else if (baselineRevision && !gitCommitExists(rootDir, baselineRevision)) {
+      degradedReason = `baseline.revision does not exist in current Git history: ${baselineRevision}`;
+    }
   }
 
   return {
@@ -97,6 +131,129 @@ export function readGitState(rootDir: string, baselineRevision: string | null): 
     untrackedPaths,
     degradedReason
   };
+}
+
+/**
+ * Reads tracked file blob hashes from the Git index with zero file content reads.
+ * Returns null if git fails.
+ */
+export function readGitIndexBlobHashes(rootDir: string): Map<string, string> | null {
+  const result = spawnSync("git", ["-c", "core.quotePath=false", "ls-files", "-s", "-z"], {
+    cwd: rootDir,
+    encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024
+  });
+  if (result.status !== 0) {
+    return null;
+  }
+  const hashes = new Map<string, string>();
+  const entries = result.stdout.split("\0");
+  for (const entry of entries) {
+    if (!entry) {
+      continue;
+    }
+    const tabIdx = entry.indexOf("\t");
+    if (tabIdx === -1) {
+      continue;
+    }
+    const meta = entry.slice(0, tabIdx).trim().split(/\s+/);
+    const filePath = entry.slice(tabIdx + 1);
+    const mode = meta[0];
+    const hash = meta[1];
+    // Regular files only (100644 or 100755); skip symlinks (120000) and submodules (160000).
+    if ((mode === "100644" || mode === "100755") && hash && filePath) {
+      hashes.set(filePath, hash);
+    }
+  }
+  return hashes;
+}
+
+/**
+ * Reads Git working-tree status via `-z` NUL-delimited porcelain v1 output.
+ * Distinguishes deleted paths from modified/added/untracked paths so the hybrid
+ * surface engine only hashes dirty/untracked files on disk.
+ */
+export function readGitWorkingTreeChanges(rootDir: string): {
+  changedOrUntracked: Set<string>;
+  deleted: Set<string>;
+} | null {
+  const result = spawnSync("git", ["-c", "core.quotePath=false", "status", "--porcelain=v1", "-z", "-uall"], {
+    cwd: rootDir,
+    encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024
+  });
+  if (result.status !== 0) {
+    return null;
+  }
+  const changedOrUntracked = new Set<string>();
+  const deleted = new Set<string>();
+  const tokens = result.stdout.split("\0");
+  for (let i = 0; i < tokens.length; i += 1) {
+    const token = tokens[i];
+    if (!token || token.length < 4) {
+      continue;
+    }
+    const x = token[0]!;
+    const y = token[1]!;
+    const filePath = token.slice(3);
+
+    // Rename or copy in porcelain -z consumes a second NUL-delimited path (the old path).
+    if (x === "R" || x === "C" || y === "R" || y === "C") {
+      const oldPath = tokens[i + 1];
+      i += 1;
+      if (oldPath) {
+        deleted.add(oldPath);
+      }
+      if (filePath) {
+        changedOrUntracked.add(filePath);
+      }
+      continue;
+    }
+
+    if (y === "D" || (x === "D" && y === " ")) {
+      deleted.add(filePath);
+    } else if (filePath) {
+      changedOrUntracked.add(filePath);
+    }
+  }
+  return { changedOrUntracked, deleted };
+}
+
+/**
+ * Reads blob hashes for every regular file in a historical Git commit tree.
+ * Used for lossless v3 -> v4 migration and cold-start file-level diff breakdown.
+ */
+export function readGitTreeBlobHashes(rootDir: string, revision: string): Map<string, string> | null {
+  if (!gitCommitExists(rootDir, revision)) {
+    return null;
+  }
+  const result = spawnSync("git", ["-c", "core.quotePath=false", "ls-tree", "-r", "-z", revision], {
+    cwd: rootDir,
+    encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024
+  });
+  if (result.status !== 0) {
+    return null;
+  }
+  const hashes = new Map<string, string>();
+  for (const entry of result.stdout.split("\0")) {
+    if (!entry) {
+      continue;
+    }
+    const tabIdx = entry.indexOf("\t");
+    if (tabIdx === -1) {
+      continue;
+    }
+    const meta = entry.slice(0, tabIdx).trim().split(/\s+/);
+    const filePath = entry.slice(tabIdx + 1);
+    const mode = meta[0];
+    const type = meta[1];
+    const hash = meta[2];
+    if (type === "blob" && (mode === "100644" || mode === "100755") && hash && filePath) {
+      hashes.set(filePath, hash);
+    }
+  }
+  return hashes;
 }
 
 export function readChangedPathsSince(rootDir: string, revision: string, headRevision: string): string[] {
@@ -136,21 +293,10 @@ export function readCommitsWithChangedPathsSince(
 }
 
 export function canAdvanceRevisions(gitState: GitState): { ok: true } | { ok: false; reason: string } {
-  if (!gitState.available || !gitState.headRevision) {
-    return { ok: false, reason: gitState.degradedReason ?? "Git state is unavailable." };
-  }
-  if (gitState.inProgressOperation) {
+  if (gitState.available && gitState.inProgressOperation) {
     return { ok: false, reason: `${gitState.inProgressOperation} is in progress; revisions cannot advance.` };
   }
   return { ok: true };
-}
-
-function isGitRepository(rootDir: string): boolean {
-  const result = spawnSync("git", ["rev-parse", "--is-inside-work-tree"], {
-    cwd: rootDir,
-    encoding: "utf8"
-  });
-  return result.status === 0 && result.stdout.trim() === "true";
 }
 
 function runGitSafe(rootDir: string, args: string[]): string | null {

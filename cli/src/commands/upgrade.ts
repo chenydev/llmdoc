@@ -1,21 +1,21 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { findProjectRootOrNull, resolveInsideRoot } from "../lib/fs.js";
-import { loadWorkspace, validateWorkspace } from "../lib/workspace.js";
+import { findProjectRootOrNull } from "../lib/fs.js";
+import { loadWorkspace, resolveWorkspaceLayout, validateWorkspace } from "../lib/workspace.js";
+import type { WorkspaceResolutionOptions } from "../types.js";
 
-interface UpgradeOptions {
+interface UpgradeOptions extends WorkspaceResolutionOptions {
   cwd: string;
   json?: boolean;
 }
 
 export async function runUpgrade(options: UpgradeOptions): Promise<unknown> {
-  const rootDir = findProjectRootOrNull(options.cwd) ?? options.cwd;
-  const configuredLlmdocDir = path.join(rootDir, "llmdoc");
-  if (fs.existsSync(configuredLlmdocDir)) {
-    resolveInsideRoot(rootDir, "llmdoc");
-  }
-  const report = fs.existsSync(configuredLlmdocDir) ? inspectLlmdocDirectory(configuredLlmdocDir) : inspectMissingLlmdoc();
+  const rootDir = findProjectRootOrNull(options.cwd, options) ?? options.cwd;
+  const layout = resolveWorkspaceLayout(rootDir, { docsDir: options.docsDir, allowMissingDocsDir: true });
+  const report = fs.existsSync(layout.llmdocDir)
+    ? inspectLlmdocDirectory(rootDir, layout.llmdocDir, layout.metaPath, options.docsDir)
+    : inspectMissingLlmdoc();
 
   if (options.json) {
     return report;
@@ -52,7 +52,7 @@ function inspectMissingLlmdoc(): UpgradeReport {
   };
 }
 
-function inspectLlmdocDirectory(llmdocDir: string): UpgradeReport {
+function inspectLlmdocDirectory(rootDir: string, llmdocDir: string, metaPath: string, docsDir?: string): UpgradeReport {
   const allFiles = walkFiles(llmdocDir);
   const legacyMarkers = ["index.md", "startup.md", "must", "overview", "memory", "records", "state/sync.md", "architecture", "guides", "reference"];
   const legacyPaths = [
@@ -61,13 +61,12 @@ function inspectLlmdocDirectory(llmdocDir: string): UpgradeReport {
       .filter((filePath) => filePath.endsWith(".md"))
       .map((filePath) => path.relative(llmdocDir, filePath).replaceAll(path.sep, "/"))
   ].filter((value, index, items) => items.indexOf(value) === index);
-  const hasV3Meta = fs.existsSync(path.join(llmdocDir, "meta.json"));
-  const hasMdx = walkFiles(llmdocDir).some((filePath) => filePath.endsWith(".mdx"));
+  const hasMeta = fs.existsSync(metaPath);
+  const hasMdx = allFiles.some((filePath) => filePath.endsWith(".mdx"));
 
-  if (hasV3Meta && hasMdx && legacyPaths.length === 0) {
-    const rootDir = path.dirname(llmdocDir);
+  if (hasMeta && hasMdx && legacyPaths.length === 0) {
     try {
-      const workspace = loadWorkspace(rootDir);
+      const workspace = loadWorkspace(rootDir, { docsDir });
       const errors = validateWorkspace(workspace).filter((issue) => issue.severity === "error");
       if (errors.length > 0) {
         return {
@@ -99,7 +98,7 @@ function inspectLlmdocDirectory(llmdocDir: string): UpgradeReport {
     };
   }
 
-  if (legacyPaths.length === 0 && !hasV3Meta && !hasMdx) {
+  if (legacyPaths.length === 0 && !hasMeta && !hasMdx) {
     return {
       status: "dry_run",
       summary: "An llmdoc/ directory was found, but it has no definitive V2 or V3 structure markers.",
@@ -117,8 +116,8 @@ function inspectLlmdocDirectory(llmdocDir: string): UpgradeReport {
     targetStructure: ["llmdoc/meta.json", "llmdoc/architecture.mdx", "llmdoc/<topic>/*.mdx (plain directories, no index.mdx entry nodes)"],
     requiresRecorderSemanticMigration: true,
     notes: [
-      hasV3Meta ? "Some V3 markers exist, but legacy structure remains; reconcile the boundary before migration." : "No complete V3 ledger was found; create a new meta.json baseline.",
-      legacyPaths.includes("state/sync.md") ? "Migrate state/sync.md to meta.json baseline.revision." : "No state/sync.md watermark was found."
+      hasMeta ? "Some V3 markers exist, but legacy structure remains; reconcile the boundary before migration." : "No complete V3 ledger was found; create a new meta.json baseline.",
+      legacyPaths.includes("state/sync.md") ? "Migrate state/sync.md to meta.json content-digest baseline." : "No state/sync.md watermark was found."
     ]
   };
 }

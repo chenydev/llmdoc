@@ -82,8 +82,16 @@ function renderHeader() {
 
   const baseline = state.baseline;
   const shortRevision = baseline.revision?.slice(0, 7);
-  if (!baseline.revision) {
+  const shortDigest = baseline.surfaceDigest?.slice(0, 14);
+  if (!baseline.revision && !baseline.surfaceDigest) {
     setChip(elements.statBaseline, "baseline missing", "bad");
+  } else if (baseline.surfaceDigest && (baseline.relevantBehindHead === null || !baseline.revision)) {
+    const staleNodes = state.nodes.filter((node) => node.status !== "fresh").length;
+    setChip(
+      elements.statBaseline,
+      staleNodes > 0 ? `digest ${shortDigest} · ${staleNodes} stale` : `digest ${shortDigest} · current`,
+      staleNodes > 0 ? "warn" : "ok"
+    );
   } else if (baseline.degradedReason || baseline.relevantBehindHead === null) {
     setChip(elements.statBaseline, `baseline ${shortRevision} · status unknown`, "warn");
   } else if (baseline.relevantBehindHead > 0) {
@@ -91,7 +99,7 @@ function renderHeader() {
   } else if (baseline.metadataOnlyBehind) {
     setChip(elements.statBaseline, `baseline ${shortRevision} · metadata-only, knowledge clean`, "ok");
   } else {
-    setChip(elements.statBaseline, `baseline ${shortRevision} · current`, "ok");
+    setChip(elements.statBaseline, `baseline ${shortRevision ?? shortDigest} · current`, "ok");
   }
 
   const validation = state.validate;

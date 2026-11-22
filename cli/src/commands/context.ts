@@ -1,13 +1,12 @@
-import { loadWorkspace } from "../lib/workspace.js";
+import { loadWorkspace, resolveCodePathInWorkspace } from "../lib/workspace.js";
 import { matchesCodePathPattern } from "../lib/search.js";
 import { CliError } from "../lib/errors.js";
-import { OutputOptions, ParsedDocument } from "../types.js";
+import { OutputOptions, ParsedDocument, WorkspaceResolutionOptions } from "../types.js";
 import { formatPaginationSummary } from "../lib/format.js";
 import { paginate, paginationMetadata } from "../lib/pagination.js";
-import { normalizeRepoRelativePath, resolveInsideRoot } from "../lib/fs.js";
 import { estimateTokens } from "../lib/markdown.js";
 
-interface ContextOptions extends OutputOptions {
+interface ContextOptions extends OutputOptions, WorkspaceResolutionOptions {
   cwd: string;
   files: string[];
 }
@@ -17,15 +16,14 @@ export function runContext(options: ContextOptions): unknown {
     throw new CliError("context requires at least one --files input.");
   }
 
-  const workspace = loadWorkspace(options.cwd);
+  const workspace = loadWorkspace(options.cwd, options);
   const normalizedFiles = options.files.map((file) => {
-    const normalized = normalizeRepoRelativePath(file);
     // 允许尚不存在的路径:"我要新建/删除这个文件,该先读哪些文档"是合法问法;
-    // resolveInsideRoot 仍负责拦截越界与 symlink 逃逸。
-    const absolutePath = resolveInsideRoot(workspace.rootDir, normalized, { allowMissing: true });
+    // resolveCodePathInWorkspace 仍负责拦截越界与 symlink 逃逸并支持多仓 codeRoots。
+    const resolved = resolveCodePathInWorkspace(workspace, file, { allowMissing: true });
     return {
-      normalized,
-      absolutePath
+      normalized: resolved.normalized,
+      absolutePath: resolved.absolutePath
     };
   });
   const documentsByFile = normalizedFiles.map((file) => ({

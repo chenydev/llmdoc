@@ -1,5 +1,5 @@
 import { readCommitsWithChangedPathsSince } from "./git.js";
-import { isImplementationSurfacePath, loadIgnorePatterns } from "./state.js";
+import { createIgnoreEngine } from "./ignore.js";
 import type { GitState } from "../types.js";
 
 export interface RepositoryRevisionHealth {
@@ -15,10 +15,11 @@ export interface RepositoryRevisionHealth {
 export function readRepositoryRevisionHealth(
   rootDir: string,
   baselineRevision: string | null,
-  git: GitState
+  git: GitState,
+  llmdocDir?: string
 ): RepositoryRevisionHealth {
   const commitsBehindHead = git.baselineBehindHead;
-  if (!baselineRevision || !git.headRevision || commitsBehindHead === null) {
+  if (!git.available || !baselineRevision || !git.headRevision || commitsBehindHead === null) {
     return { commitsBehindHead, relevantCommitsBehindHead: null, metadataOnlyBehind: false };
   }
   if (commitsBehindHead === 0) {
@@ -29,9 +30,9 @@ export function readRepositoryRevisionHealth(
   if (commits === null) {
     return { commitsBehindHead, relevantCommitsBehindHead: null, metadataOnlyBehind: false };
   }
-  const ignorePatterns = loadIgnorePatterns(rootDir);
+  const ignoreEngine = createIgnoreEngine(rootDir, { llmdocDir });
   const relevantCommitsBehindHead = commits.filter((commit) =>
-    commit.paths.some((filePath) => isImplementationSurfacePath(filePath, ignorePatterns))
+    commit.paths.some((filePath) => ignoreEngine.isImplementationSurface(filePath))
   ).length;
   return {
     commitsBehindHead,

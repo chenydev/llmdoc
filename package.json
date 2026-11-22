@@ -1,10 +1,14 @@
 {
   "name": "@tokenroll/llmdoc-repository",
-  "version": "3.6.1",
+  "version": "4.0.0",
   "private": true,
-  "description": "Development workspace for the llmdoc V3 CLI and plugin surfaces",
+  "description": "Development workspace for the llmdoc CLI and Claude/Codex/Antigravity plugin surfaces",
   "scripts": {
     "build": "npm --prefix cli run build",
+    "build:agy": "node scripts/build-agy-plugin.mjs",
+    "install:agy": "node scripts/install-agy-plugin.mjs",
+    "sync:surfaces": "node scripts/sync-surfaces.mjs",
+    "check:surfaces": "node scripts/check-codex-surface.mjs",
     "lint": "npm --prefix cli run lint",
     "test": "npm --prefix cli test",
     "typecheck": "npm --prefix cli run typecheck",

@@ -277,13 +277,39 @@ export function removeGitDirectory(rootDir: string): void {
   fs.rmSync(path.join(rootDir, ".git"), { recursive: true, force: true });
 }
 
-export function readMeta(rootDir: string): {
-  baseline: { revision: string; verifiedAt: string };
-  documents: Record<string, { validatedRevision: string }>;
+export function readMeta(rootDir: string, metaRelativePath = "llmdoc/meta.json"): {
+  schema: "llmdoc.meta/v4" | "llmdoc.meta/v3";
+  baseline: {
+    revision?: string;
+    surfaceDigest?: string | null;
+    hintRevision?: string | null;
+    verifiedAt: string;
+  };
+  documents: Record<
+    string,
+    {
+      validatedRevision?: string | null;
+      codeDigest?: string | null;
+      hintRevision?: string | null;
+    }
+  >;
 } {
-  return JSON.parse(fs.readFileSync(path.join(rootDir, "llmdoc", "meta.json"), "utf8")) as {
-    baseline: { revision: string; verifiedAt: string };
-    documents: Record<string, { validatedRevision: string }>;
+  return JSON.parse(fs.readFileSync(path.join(rootDir, metaRelativePath), "utf8")) as {
+    schema: "llmdoc.meta/v4" | "llmdoc.meta/v3";
+    baseline: {
+      revision?: string;
+      surfaceDigest?: string | null;
+      hintRevision?: string | null;
+      verifiedAt: string;
+    };
+    documents: Record<
+      string,
+      {
+        validatedRevision?: string | null;
+        codeDigest?: string | null;
+        hintRevision?: string | null;
+      }
+    >;
   };
 }
 

@@ -2,23 +2,24 @@ import fs from "node:fs";
 
 import { assertDocKindMatchesShape, parseDocTargetShape } from "../lib/doc-shape.js";
 import { CliError } from "../lib/errors.js";
-import { findProjectRoot, normalizeRepoRelativePath, resolveInsideRoot } from "../lib/fs.js";
+import { findProjectRoot, normalizeRepoRelativePath } from "../lib/fs.js";
 import { writeMeta } from "../lib/state.js";
-import { loadWorkspace, validateWorkspace } from "../lib/workspace.js";
+import { loadWorkspace, resolveDocPathInWorkspace, validateWorkspace } from "../lib/workspace.js";
+import type { WorkspaceResolutionOptions } from "../types.js";
 
-interface AdoptOptions {
+interface AdoptOptions extends WorkspaceResolutionOptions {
   cwd: string;
   paths: string[];
   json?: boolean;
 }
 
-// 无损登记已存在的合法 .mdx 到 meta.json:只新增 validatedRevision: null 条目,
-// 不重写正文;已登记路径幂等 no-op。有效 revision 仍需后续 fingerprint 验证后写入。
+// 无损登记已存在的合法 .mdx 到 meta.json:只新增未验证条目,
+// 不重写正文;已登记路径幂等 no-op。有效摘要由后续 finalize/fingerprint 验证后写入。
 export function runAdopt(options: AdoptOptions): unknown {
-  const rootDir = findProjectRoot(options.cwd);
-  const workspace = loadWorkspace(rootDir);
+  const rootDir = findProjectRoot(options.cwd, options);
+  const workspace = loadWorkspace(rootDir, options);
   if (!workspace.meta) {
-    throw new CliError("llmdoc/meta.json is missing; run llmdoc init-state first.");
+    throw new CliError(`${workspace.metaDisplayPath} is missing; run \`llmdoc init-state\` first.`);
   }
 
   const llmdocPaths = options.paths.map((input) => {
@@ -28,7 +29,7 @@ export function runAdopt(options: AdoptOptions): unknown {
     }
     const shape = parseDocTargetShape(repoRelativePath);
     assertDocKindMatchesShape(shape);
-    const absolutePath = resolveInsideRoot(rootDir, repoRelativePath, { allowMissing: true });
+    const absolutePath = resolveDocPathInWorkspace(workspace.llmdocDir, shape.llmdocPath, { allowMissing: true });
     if (!fs.existsSync(absolutePath)) {
       throw new CliError(`Target does not exist; adopt registers existing documents only (use llmdoc new to create one): ${repoRelativePath}`);
     }
@@ -55,7 +56,11 @@ export function runAdopt(options: AdoptOptions): unknown {
     if (workspace.meta.documents[llmdocPath]) {
       alreadyRegistered.push(llmdocPath);
     } else {
-      workspace.meta.documents[llmdocPath] = { validatedRevision: null };
+      if (workspace.meta.schema === "llmdoc.meta/v4") {
+        workspace.meta.documents[llmdocPath] = { codeDigest: null, hintRevision: null };
+      } else {
+        workspace.meta.documents[llmdocPath] = { validatedRevision: null };
+      }
       adopted.push(llmdocPath);
     }
   }
@@ -74,7 +79,7 @@ export function runAdopt(options: AdoptOptions): unknown {
     lines.push(`already registered (no-op): ${alreadyRegistered.join(", ")}`);
   }
   if (adopted.length > 0) {
-    lines.push("validatedRevision was registered as null; after validation, use fingerprint/commit to write a valid revision.");
+    lines.push("codeDigest was registered as null; after validation, use finalize/fingerprint/commit to record a valid digest.");
   }
   return lines.join("\n");
 }

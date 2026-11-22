@@ -82,7 +82,7 @@ export function formatStartupPreloadDocuments(documents: readonly ParsedDocument
     return "";
   }
   const lines = [
-    `llmdoc startup preload begins (${documents.length} document(s)). The configured bodies are provided directly below. If the final completion marker is visible, these bodies are complete and do not need another search/show; otherwise retrieve any missing document with npx @tokenroll/llmdoc show.`
+    `llmdoc startup preload begins (${documents.length} document(s)). The configured bodies are provided directly below. If the final completion marker is visible, these bodies are complete and do not need another search/show; otherwise retrieve any missing document with llmdoc show.`
   ];
   for (const document of documents) {
     lines.push("", `=== llmdoc/${document.llmdocPath} [${document.frontmatter.kind}] (startup preload) ===`, document.body);
@@ -97,7 +97,7 @@ export function formatCompactPreloadIndex(preloadPaths: readonly string[]): stri
   }
   return `Configured startup preload bodies were not re-injected after compaction. Document IDs: ${preloadPaths
     .map((preloadPath) => `llmdoc/${preloadPath}`)
-    .join(", ")}. Retrieve a body with npx @tokenroll/llmdoc show only when the compacted context no longer contains what the task needs.`;
+    .join(", ")}. Retrieve a body with llmdoc show only when the compacted context no longer contains what the task needs.`;
 }
 
 export function rewriteStartupPreloadForMove(

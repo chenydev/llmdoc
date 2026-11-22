@@ -31,14 +31,14 @@ describe("cold-start workflow", () => {
     expect(payload.next).toContain("init-state");
   });
 
-  test("new refuses a directory without a Git repository with an actionable remedy", async () => {
+  test("new works directly in a non-Git directory using cwd", async () => {
     const plainDir = fs.mkdtempSync(path.join(os.tmpdir(), "llmdoc-no-git-"));
 
     const result = await runCli(["new", "architecture.mdx", "--kind", "architecture"], plainDir);
 
-    expect(result.exitCode).toBe(2);
-    expect(result.stdout).toContain("git init");
-    expect(fs.existsSync(path.join(plainDir, "llmdoc"))).toBe(false);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("created: llmdoc/architecture.mdx");
+    expect(fs.existsSync(path.join(plainDir, "llmdoc", "architecture.mdx"))).toBe(true);
   });
 
   test("new preserves the existing non-Git llmdoc compatibility path", async () => {
@@ -51,7 +51,7 @@ describe("cold-start workflow", () => {
     expect(fs.existsSync(path.join(plainDir, "llmdoc", "architecture.mdx"))).toBe(true);
   });
 
-  test("init-state explains unborn HEAD and then exposes the validated bootstrap sequence", async () => {
+  test("init-state works on an unborn Git branch without requiring an initial commit", async () => {
     const rootDir = createEmptyGitRepository();
     const created = await runCli(["new", "architecture.mdx", "--kind", "architecture"], rootDir);
     expect(created.exitCode).toBe(0);
@@ -60,25 +60,30 @@ describe("cold-start workflow", () => {
     expect(missingMeta.exitCode).toBe(1);
     expect(missingMeta.stdout).toContain("init-state");
 
-    const unborn = await runCli(["init-state"], rootDir);
-    expect(unborn.exitCode).toBe(1);
-    expect(unborn.stdout).toContain("HEAD has no commit");
-    expect(unborn.stdout).toContain("git commit --allow-empty");
-
-    commitEmpty(rootDir);
     const initialized = await runCli(["--json", "init-state"], rootDir);
-    const payload = JSON.parse(initialized.stdout) as { status: string; next: string };
     expect(initialized.exitCode).toBe(0);
+    const payload = JSON.parse(initialized.stdout) as {
+      status: string;
+      schema: string;
+      baselineDigest: string | null;
+      baselineRevision: string | null;
+      next: string;
+    };
     expect(payload.status).toBe("success");
+    expect(payload.schema).toBe("llmdoc.meta/v4");
+    expect(payload.baselineDigest).toMatch(/^sha256:/);
+    expect(payload.baselineRevision).toBeNull();
     expect(payload.next).toContain("validate");
-    expect(payload.next).toContain("commit --all");
-    expect(payload.next).not.toContain("fingerprint");
 
     const validated = await runCli(["validate"], rootDir);
     expect(validated.exitCode).toBe(0);
+
+    const finalized = await runCli(["--json", "finalize", "--all"], rootDir);
+    expect(finalized.exitCode).toBe(0);
+    expect(JSON.parse(finalized.stdout)).toMatchObject({ status: "success", updateAll: true });
   });
 
-  test("new synchronizes an existing ledger without repeating the bootstrap hint", async () => {
+  test("new synchronizes an existing v4 ledger without repeating the bootstrap hint", async () => {
     const rootDir = createEmptyGitRepository();
     await runCli(["new", "architecture.mdx", "--kind", "architecture"], rootDir);
     commitEmpty(rootDir);
@@ -93,9 +98,11 @@ describe("cold-start workflow", () => {
     expect(payload.next).toBeNull();
 
     const meta = JSON.parse(fs.readFileSync(path.join(rootDir, "llmdoc", "meta.json"), "utf8")) as {
-      documents: Record<string, { validatedRevision: string | null }>;
+      schema: string;
+      documents: Record<string, { codeDigest: string | null; hintRevision: string | null }>;
     };
-    expect(meta.documents["runtime/details.mdx"]).toEqual({ validatedRevision: null });
+    expect(meta.schema).toBe("llmdoc.meta/v4");
+    expect(meta.documents["runtime/details.mdx"]).toEqual({ codeDigest: null, hintRevision: null });
   });
 });
 

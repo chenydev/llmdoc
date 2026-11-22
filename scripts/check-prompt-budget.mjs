@@ -57,10 +57,14 @@ for (const hookCase of hookCases) {
   }
 }
 
-// The direct dist checks above prove current hook semantics. Execute the actual
-// plugin commands too: npm package resolution is a separate launcher boundary,
-// and a same-name local/file dependency can otherwise shadow the scoped CLI.
+// Execute the actual plugin hook commands with local node_modules/.bin on PATH
+// so they test the built fork CLI directly without touching npm.
 const hookConfig = JSON.parse(fs.readFileSync(path.join(root, "hooks/hooks.json"), "utf8"));
+const localBinDir = path.join(root, "node_modules", ".bin");
+const hookEnv = {
+  ...process.env,
+  PATH: `${localBinDir}${path.delimiter}${process.env.PATH ?? ""}`
+};
 const launcherCases = [
   { event: "SessionStart", stdin: JSON.stringify({ source: "startup" }), json: false },
   { event: "Stop", stdin: "{}", json: true },
@@ -78,6 +82,7 @@ for (const launcherCase of launcherCases) {
     encoding: "utf8",
     input: launcherCase.stdin,
     shell: true,
+    env: hookEnv,
     timeout: 120_000
   });
   if (result.error) {

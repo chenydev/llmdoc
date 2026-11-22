@@ -25,6 +25,7 @@ export type OutputSchemaName =
   | "mv"
   | "hook"
   | "initState"
+  | "finalize"
   | "commit";
 
 type AjvConstructor = new (options: { allErrors: boolean; strict: boolean }) => {

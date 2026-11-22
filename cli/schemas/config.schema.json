@@ -12,6 +12,52 @@
       "type": "string",
       "const": "llmdoc.config/v1"
     },
+    "docsDir": {
+      "type": "string",
+      "minLength": 1
+    },
+    "codeRoots": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          {
+            "type": "string",
+            "minLength": 1
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "path"],
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^[A-Za-z0-9._-]+$"
+              },
+              "path": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        ]
+      }
+    },
+    "state": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "location": {
+          "type": "string",
+          "enum": ["tracked", "local"],
+          "default": "tracked"
+        },
+        "localPath": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
     "startup": {
       "type": "object",
       "additionalProperties": false,

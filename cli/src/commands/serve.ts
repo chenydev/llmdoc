@@ -2,6 +2,7 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 
 import { createViewerRequestHandler } from "../lib/viewer-http.js";
+import type { WorkspaceResolutionOptions } from "../types.js";
 
 export interface ViewerServer {
   port: number;
@@ -9,14 +10,14 @@ export interface ViewerServer {
   close: () => Promise<void>;
 }
 
-interface ServeOptions {
+interface ServeOptions extends WorkspaceResolutionOptions {
   cwd: string;
   port?: number;
 }
 
 // 长驻前台进程：启动本地 Viewer，Ctrl-C 退出。仅绑定 127.0.0.1，不对外暴露。
 export async function runServe(options: ServeOptions): Promise<string> {
-  const server = await startViewerServer(options.cwd, options.port ?? 4973);
+  const server = await startViewerServer(options.cwd, options.port ?? 4973, { docsDir: options.docsDir });
   process.stdout.write(`llmdoc viewer: ${server.url}  (press Ctrl-C to stop)\n`);
   await new Promise<void>((resolve, reject) => {
     const shutdown = (): void => {
@@ -30,8 +31,12 @@ export async function runServe(options: ServeOptions): Promise<string> {
   return "viewer stopped";
 }
 
-export function startViewerServer(rootDir: string, requestedPort = 0): Promise<ViewerServer> {
-  const server = http.createServer(createViewerRequestHandler(rootDir));
+export function startViewerServer(
+  rootDir: string,
+  requestedPort = 0,
+  options?: Pick<WorkspaceResolutionOptions, "docsDir">
+): Promise<ViewerServer> {
+  const server = http.createServer(createViewerRequestHandler(rootDir, options));
 
   return new Promise((resolve, reject) => {
     server.once("error", reject);

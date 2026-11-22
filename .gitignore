@@ -1,6 +1,9 @@
 .llmdoc-tmp/
 node_modules/
+dist/
 cli/dist/
 cli/coverage/
 cli/*.tgz
 *.tsbuildinfo
+__pycache__/
+*.pyc

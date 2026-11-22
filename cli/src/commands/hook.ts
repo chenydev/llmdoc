@@ -1,12 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { analyzeDelta } from "../lib/state.js";
-import { loadWorkspace } from "../lib/workspace.js";
+import { analyzeDelta, getMetaBaselineDigest, getMetaBaselineRevision } from "../lib/state.js";
+import { loadWorkspace, resolveWorkspaceLayout } from "../lib/workspace.js";
 import { formatCompactPreloadIndex, formatStartupPreloadDocuments, loadLlmdocConfig } from "../lib/config.js";
-import type { LoadedLlmdocConfig } from "../types.js";
+import type { LoadedLlmdocConfig, WorkspaceResolutionOptions } from "../types.js";
 
-interface HookOptions {
+interface HookOptions extends WorkspaceResolutionOptions {
   cwd: string;
   mode: "session-start" | "stop" | "compact";
   stdin: string;
@@ -18,13 +18,13 @@ const SESSION_START_GUIDANCE =
 
 export function runHook(options: HookOptions): string {
   try {
-    const hasLlmdoc = fs.existsSync(path.join(options.cwd, "llmdoc"));
+    const hasLlmdoc = workspaceHasDocsDir(options.cwd, options);
     switch (options.mode) {
       case "session-start":
         // 未启用 llmdoc 的项目保持静默,不注入任何内容。
-        return hasLlmdoc ? runSessionStart(options.cwd, options.stdin) : "";
+        return hasLlmdoc ? runSessionStart(options.cwd, options.stdin, options) : "";
       case "stop":
-        return JSON.stringify(hasLlmdoc ? runStop(options.cwd) : { continue: true }, null, 2);
+        return JSON.stringify(hasLlmdoc ? runStop(options.cwd, options) : { continue: true }, null, 2);
       case "compact":
         return JSON.stringify(hasLlmdoc ? runCompact() : { continue: true }, null, 2);
     }
@@ -45,26 +45,44 @@ export function runHook(options: HookOptions): string {
   }
 }
 
-function runSessionStart(cwd: string, stdin: string): string {
+function workspaceHasDocsDir(cwd: string, options: Pick<WorkspaceResolutionOptions, "docsDir">): boolean {
+  try {
+    const layout = resolveWorkspaceLayout(cwd, { docsDir: options.docsDir, allowMissingDocsDir: true });
+    return fs.existsSync(layout.llmdocDir) && fs.statSync(layout.llmdocDir).isDirectory();
+  } catch {
+    return fs.existsSync(path.join(cwd, "llmdoc"));
+  }
+}
+
+function runSessionStart(cwd: string, stdin: string, options: Pick<WorkspaceResolutionOptions, "docsDir">): string {
   const source = inferSource(stdin);
   const lifecycle = source === "compact" ? "compact re-entry" : "cold start";
   try {
-    const workspace = loadWorkspace(cwd);
+    const workspace = loadWorkspace(cwd, options);
     const delta = analyzeDelta(workspace);
     const signal = summarizeHookDelta(delta);
     const pendingLessonCandidates = countPendingLessonCandidates(cwd);
     const parts = [`llmdoc ${lifecycle}`];
-    // fingerprint/commit 正常收尾会让 HEAD 前进到仅修改 llmdoc/meta.json 的 follow-up commit。
-    // 没有可执行影响时不展示 raw baseline 落后数，避免把知识面自身更新误报成需要再次 update。
     if (!signal.shouldUpdate) {
       parts.push("documents have no actionable impacts");
       if (pendingLessonCandidates > 0) {
         parts.push(`${pendingLessonCandidates} pending reflection candidate(s)`);
       }
     } else {
-      const baseline = workspace.meta?.baseline.revision ? workspace.meta.baseline.revision.slice(0, 7) : "missing";
-      const freshness = delta.git.baselineBehindHead === null ? "distance unknown" : delta.git.baselineBehindHead === 0 ? "at HEAD" : `${delta.git.baselineBehindHead} commit(s) behind HEAD`;
-      parts.push(`baseline ${baseline}(${freshness})`);
+      const baselineDigest = getMetaBaselineDigest(workspace.meta);
+      const baselineRevision = getMetaBaselineRevision(workspace.meta);
+      const baselineLabel = baselineDigest
+        ? `${baselineDigest.slice(0, 14)}(${delta.trackingMode})`
+        : baselineRevision
+          ? `${baselineRevision.slice(0, 7)}(${
+              delta.git.baselineBehindHead === null
+                ? "distance unknown"
+                : delta.git.baselineBehindHead === 0
+                  ? "at HEAD"
+                  : `${delta.git.baselineBehindHead} commit(s) behind HEAD`
+            })`
+          : "missing";
+      parts.push(`baseline ${baselineLabel}`);
       const summary = [
         signal.impactedCount > 0 ? `${signal.impactedCount} impacted document(s)` : null,
         signal.needsReviewCount > 0 ? `${signal.needsReviewCount} document(s) need review` : null,
@@ -72,7 +90,7 @@ function runSessionStart(cwd: string, stdin: string): string {
       ]
         .filter(Boolean)
         .join(", ");
-      parts.push(`${summary} → inspect npx @tokenroll/llmdoc delta first`);
+      parts.push(`${summary} → inspect llmdoc delta first`);
       if (pendingLessonCandidates > 0) {
         parts.push(`${pendingLessonCandidates} pending reflection candidate(s)`);
       }
@@ -111,20 +129,20 @@ function appendStartupConfigIssues(context: string[], startupConfig: LoadedLlmdo
   if (errors.length > 0) {
     context.push(
       startupConfig.config
-        ? "llmdoc.config.json has invalid startup.preload entries; preload was skipped while the valid remindSkill preference remained applied. Run npx @tokenroll/llmdoc validate for details."
-        : "llmdoc.config.json could not be applied; preload was skipped and the default skill reminder remains active. Run npx @tokenroll/llmdoc validate for details."
+        ? "llmdoc.config.json has invalid startup.preload entries; preload was skipped while the valid remindSkill preference remained applied. Run llmdoc validate for details."
+        : "llmdoc.config.json could not be applied; preload was skipped and the default skill reminder remains active. Run llmdoc validate for details."
     );
   }
   if (warnings.length > 0) {
     context.push(
-      "llmdoc.config.json has warnings; normalized duplicate startup.preload entries were ignored. Run npx @tokenroll/llmdoc validate for details."
+      "llmdoc.config.json has warnings; normalized duplicate startup.preload entries were ignored. Run llmdoc validate for details."
     );
   }
 }
 
-function runStop(cwd: string): object {
+function runStop(cwd: string, options: Pick<WorkspaceResolutionOptions, "docsDir">): object {
   try {
-    const workspace = loadWorkspace(cwd);
+    const workspace = loadWorkspace(cwd, options);
     const delta = analyzeDelta(workspace);
     const signal = summarizeHookDelta(delta);
     const pendingLessonCandidates = countPendingLessonCandidates(cwd);
@@ -144,9 +162,9 @@ function runStop(cwd: string): object {
     const guidance =
       pendingLessonCandidates > 0
         ? signal.shouldUpdate
-          ? "the workflow will read pending candidates; inspect code impact with npx @tokenroll/llmdoc delta first"
+          ? "the workflow will read pending candidates; inspect code impact with llmdoc delta first"
           : "the workflow will read pending candidates"
-        : "inspect impact with npx @tokenroll/llmdoc delta first";
+        : "inspect impact with llmdoc delta first";
     return {
       continue: true,
       systemMessage: `llmdoc: ${summary}. Consider running ${updateCommand} (${guidance}). ${reasons}`.trim()

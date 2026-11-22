@@ -1,20 +1,19 @@
 import { paginate } from "../lib/pagination.js";
 import { assertDocumentKind } from "../lib/doc-shape.js";
 import { loadWorkspace } from "../lib/workspace.js";
-import { OutputOptions } from "../types.js";
+import { OutputOptions, ParsedDocument, WorkspaceResolutionOptions } from "../types.js";
 import { formatPaginationSummary } from "../lib/format.js";
 import { paginationMetadata } from "../lib/pagination.js";
 import { estimateTokens } from "../lib/markdown.js";
-import { ParsedDocument } from "../types.js";
 
-interface IndexOptions extends OutputOptions {
+interface IndexOptions extends OutputOptions, WorkspaceResolutionOptions {
   cwd: string;
   topic?: string;
   kind?: string;
 }
 
 export function runIndex(options: IndexOptions): unknown {
-  const workspace = loadWorkspace(options.cwd);
+  const workspace = loadWorkspace(options.cwd, options);
   const kind = options.kind ? assertDocumentKind(options.kind) : undefined;
   const filtered = workspace.documents.filter((document) => {
     if (options.topic && document.topic !== options.topic) {

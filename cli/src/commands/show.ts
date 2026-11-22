@@ -1,18 +1,18 @@
 import { paginate, paginationMetadata } from "../lib/pagination.js";
 import { loadWorkspace } from "../lib/workspace.js";
 import { CliError } from "../lib/errors.js";
-import { OutputOptions, ParsedDocument } from "../types.js";
+import { OutputOptions, ParsedDocument, WorkspaceResolutionOptions } from "../types.js";
 import { DEFAULT_SHOW_BUDGET } from "../lib/constants.js";
 import { formatPaginationSummary } from "../lib/format.js";
 import { estimateTokens } from "../lib/markdown.js";
 
-interface ShowOptions extends OutputOptions {
+interface ShowOptions extends OutputOptions, WorkspaceResolutionOptions {
   cwd: string;
   paths: string[];
 }
 
 export function runShow(options: ShowOptions): unknown {
-  const workspace = loadWorkspace(options.cwd);
+  const workspace = loadWorkspace(options.cwd, options);
   const documents = options.paths.map((rawPath) => {
     const normalized = rawPath.startsWith("llmdoc/") ? rawPath.slice("llmdoc/".length) : rawPath;
     const document = workspace.documentsByLlmdocPath.get(normalized);

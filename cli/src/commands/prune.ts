@@ -1,9 +1,9 @@
 import { FRAGMENT_TOKEN_THRESHOLD } from "../lib/constants.js";
 import { computeGrowthState } from "../lib/state.js";
 import { loadWorkspace } from "../lib/workspace.js";
-import { ParsedDocument } from "../types.js";
+import { ParsedDocument, WorkspaceResolutionOptions } from "../types.js";
 
-interface PruneOptions {
+interface PruneOptions extends WorkspaceResolutionOptions {
   cwd: string;
   json?: boolean;
   report?: boolean;
@@ -23,7 +23,7 @@ export function runPrune(options: PruneOptions): unknown {
       : "prune currently supports only --report.";
   }
 
-  const workspace = loadWorkspace(options.cwd);
+  const workspace = loadWorkspace(options.cwd, options);
   const growth = computeGrowthState(workspace);
   const duplicateCandidates = findDuplicateCandidates(workspace.documents);
   const mergeCandidates = findMergeCandidates(workspace.documents);

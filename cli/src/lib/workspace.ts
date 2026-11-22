@@ -1,28 +1,105 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import matter from "gray-matter";
 
-import { ParsedDocument, ValidationIssue, WorkspaceData, MetaLedger, DocumentFrontmatter } from "../types.js";
+import {
+  DocumentFrontmatter,
+  LlmdocConfig,
+  MetaLedger,
+  ParsedDocument,
+  ResolvedCodeRoot,
+  ValidationIssue,
+  WorkspaceData,
+  WorkspaceResolutionOptions
+} from "../types.js";
 import { DOC_LINE_WARNING_LIMIT } from "./constants.js";
 import { CliError } from "./errors.js";
-import { estimateTokens, extractCodeRefs, extractLinks, extractTitle, resolveDocLink, stripMarkdownLiterals, validateCodeRefTags } from "./markdown.js";
+import {
+  estimateTokens,
+  extractCodeRefs,
+  extractLinks,
+  extractTitle,
+  resolveDocLink,
+  stripMarkdownLiterals,
+  validateCodeRefTags
+} from "./markdown.js";
 import { assertDocKindMatchesShape, parseDocTargetShape } from "./doc-shape.js";
-import { normalizeRepoRelativePath, repoPath, resolveInsideRoot } from "./fs.js";
-import { gitCommitExists, isShallowRepository } from "./git.js";
+import { isWithinRoot, normalizeRepoRelativePath, repoPath, resolveExplicitDocsDir, resolveInsideRoot } from "./fs.js";
+import { gitCommitExists, isGitRepository, isShallowRepository } from "./git.js";
+import { createIgnoreEngine, IgnoreEngine } from "./ignore.js";
 import { matchesCodePathPattern } from "./search.js";
 import { validateDocFrontmatter, validateMeta } from "./schema.js";
-import { loadLlmdocConfig } from "./config.js";
+import { LLMDOC_CONFIG_FILENAME, loadLlmdocConfig } from "./config.js";
 
-export function loadWorkspace(rootDir: string): WorkspaceData {
-  const configuredLlmdocDir = path.join(rootDir, "llmdoc");
-  if (!fs.existsSync(configuredLlmdocDir) || !fs.statSync(configuredLlmdocDir).isDirectory()) {
-    throw new CliError("The repository does not contain an llmdoc/ directory.", 2);
+export interface ResolvedWorkspaceLayout {
+  rootDir: string;
+  llmdocDir: string;
+  docsDirExternal: boolean;
+  codeRoots: ResolvedCodeRoot[];
+  metaPath: string;
+  metaLocation: "tracked" | "local";
+  metaDisplayPath: string;
+  configIssues: ValidationIssue[];
+}
+
+export function resolveWorkspaceLayout(
+  rootDir: string,
+  options?: Pick<WorkspaceResolutionOptions, "docsDir"> & { allowMissingDocsDir?: boolean }
+): ResolvedWorkspaceLayout {
+  const resolvedRoot = path.resolve(rootDir);
+  const earlyConfig = loadLlmdocConfig(resolvedRoot);
+  const config = earlyConfig.config;
+  const configIssues: ValidationIssue[] = [];
+
+  const explicitDocsDir = resolveExplicitDocsDir(resolvedRoot, options);
+  const configuredDocsDir = config?.docsDir?.trim() || null;
+
+  let llmdocDir: string;
+  let docsDirExternal = false;
+
+  if (explicitDocsDir) {
+    llmdocDir = explicitDocsDir;
+    docsDirExternal = !isPathInsideDir(resolvedRoot, llmdocDir);
+  } else if (configuredDocsDir) {
+    llmdocDir = path.isAbsolute(configuredDocsDir)
+      ? path.resolve(configuredDocsDir)
+      : path.resolve(resolvedRoot, configuredDocsDir);
+    docsDirExternal = !isPathInsideDir(resolvedRoot, llmdocDir);
+  } else {
+    const defaultDocsDir = path.join(resolvedRoot, "llmdoc");
+    if (fs.existsSync(defaultDocsDir)) {
+      resolveInsideRoot(resolvedRoot, "llmdoc");
+    }
+    llmdocDir = defaultDocsDir;
+    docsDirExternal = false;
   }
-  resolveInsideRoot(rootDir, "llmdoc");
-  const llmdocDir = configuredLlmdocDir;
 
-  const preloadIssues: ValidationIssue[] = [];
-  const documents = scanDocuments(rootDir, llmdocDir, preloadIssues);
+  if (!options?.allowMissingDocsDir && (!fs.existsSync(llmdocDir) || !fs.statSync(llmdocDir).isDirectory())) {
+    throw new CliError(`The workspace does not contain a docs directory at ${llmdocDir}.`, 2);
+  }
+
+  const codeRoots = resolveCodeRoots(resolvedRoot, config, configIssues);
+  const { metaPath, metaLocation, metaDisplayPath } = resolveMetaPath(resolvedRoot, llmdocDir, config);
+
+  return {
+    rootDir: resolvedRoot,
+    llmdocDir,
+    docsDirExternal,
+    codeRoots,
+    metaPath,
+    metaLocation,
+    metaDisplayPath,
+    configIssues
+  };
+}
+
+export function loadWorkspace(rootDir: string, options?: Pick<WorkspaceResolutionOptions, "docsDir">): WorkspaceData {
+  const layout = resolveWorkspaceLayout(rootDir, options);
+  const preloadIssues: ValidationIssue[] = [...layout.configIssues];
+
+  const documents = scanDocuments(layout.llmdocDir, preloadIssues);
   const documentsByLlmdocPath = new Map(documents.map((document) => [document.llmdocPath, document]));
   const topics = new Map<string, ParsedDocument[]>();
   const rootSingletons: ParsedDocument[] = [];
@@ -42,14 +119,17 @@ export function loadWorkspace(rootDir: string): WorkspaceData {
   }
   rootSingletons.sort((left, right) => left.llmdocPath.localeCompare(right.llmdocPath));
 
-  const metaPath = path.join(llmdocDir, "meta.json");
-  const meta = loadMeta(metaPath, preloadIssues);
-  const llmdocConfig = loadLlmdocConfig(rootDir, documentsByLlmdocPath);
+  const meta = loadMeta(layout.metaPath, layout.metaDisplayPath, preloadIssues);
+  const llmdocConfig = loadLlmdocConfig(layout.rootDir, documentsByLlmdocPath);
 
   return {
-    rootDir,
-    llmdocDir,
-    metaPath,
+    rootDir: layout.rootDir,
+    llmdocDir: layout.llmdocDir,
+    docsDirExternal: layout.docsDirExternal,
+    codeRoots: layout.codeRoots,
+    metaPath: layout.metaPath,
+    metaLocation: layout.metaLocation,
+    metaDisplayPath: layout.metaDisplayPath,
     documents,
     documentsByLlmdocPath,
     topics,
@@ -60,17 +140,165 @@ export function loadWorkspace(rootDir: string): WorkspaceData {
   };
 }
 
-function scanDocuments(rootDir: string, llmdocDir: string, preloadIssues: ValidationIssue[]): ParsedDocument[] {
+export function resolveDocPathInWorkspace(
+  llmdocDir: string,
+  llmdocRelativePath: string,
+  options?: { allowMissing?: boolean }
+): string {
+  const cleanRel = llmdocRelativePath.startsWith("llmdoc/")
+    ? llmdocRelativePath.slice("llmdoc/".length)
+    : llmdocRelativePath;
+  return resolveInsideRoot(llmdocDir, cleanRel, options);
+}
+
+export function resolveCodePathInWorkspace(
+  workspace: Pick<WorkspaceData, "rootDir" | "codeRoots">,
+  input: string,
+  options?: { allowMissing?: boolean }
+): { absolutePath: string; normalized: string; codeRoot: ResolvedCodeRoot } {
+  const normalized = normalizeRepoRelativePath(input);
+  const namedRoots = workspace.codeRoots
+    .filter((root): root is ResolvedCodeRoot & { name: string } => Boolean(root.name))
+    .sort((left, right) => right.name.length - left.name.length);
+
+  for (const root of namedRoots) {
+    if (normalized === root.name) {
+      const absolutePath = fs.existsSync(root.absolutePath) ? fs.realpathSync(root.absolutePath) : root.absolutePath;
+      return { absolutePath, normalized, codeRoot: root };
+    }
+    if (normalized.startsWith(`${root.name}/`)) {
+      const innerPath = normalized.slice(root.name.length + 1);
+      const absolutePath = resolveInsideRoot(root.absolutePath, innerPath, options);
+      return { absolutePath, normalized, codeRoot: root };
+    }
+  }
+
+  const defaultRoot: ResolvedCodeRoot = workspace.codeRoots.find((root) => root.name === null) ?? {
+    name: null,
+    configuredPath: ".",
+    absolutePath: workspace.rootDir
+  };
+  const absolutePath = resolveInsideRoot(defaultRoot.absolutePath, normalized, options);
+  return { absolutePath, normalized, codeRoot: defaultRoot };
+}
+
+function resolveCodeRoots(rootDir: string, config: LlmdocConfig | null, issues: ValidationIssue[]): ResolvedCodeRoot[] {
+  const configured = config?.codeRoots;
+  if (!configured || configured.length === 0) {
+    return [{ name: null, configuredPath: ".", absolutePath: rootDir }];
+  }
+
+  const resolvedRoots: ResolvedCodeRoot[] = [];
+  const seenNames = new Set<string>();
+  const rootRealPath = safeRealpath(rootDir);
+
+  for (const entry of configured) {
+    const rawPath = typeof entry === "string" ? entry : entry.path;
+    const absolutePath = path.isAbsolute(rawPath) ? path.resolve(rawPath) : path.resolve(rootDir, rawPath);
+    let name: string;
+    if (typeof entry === "string") {
+      const rel = path.relative(rootRealPath, safeRealpath(absolutePath)).replaceAll(path.sep, "/");
+      if (rel && !rel.startsWith("..") && !path.isAbsolute(rel)) {
+        name = rel.replace(/\/+$/, "");
+      } else {
+        name = path.basename(absolutePath);
+      }
+    } else {
+      name = entry.name;
+    }
+
+    if (seenNames.has(name)) {
+      issues.push({
+        severity: "error",
+        code: "config.codeRoots.duplicate",
+        path: LLMDOC_CONFIG_FILENAME,
+        message: `Duplicate codeRoots name: ${name}`
+      });
+      continue;
+    }
+    seenNames.add(name);
+
+    if (!fs.existsSync(absolutePath) || !fs.statSync(absolutePath).isDirectory()) {
+      issues.push({
+        severity: "error",
+        code: "config.codeRoots.missing",
+        path: LLMDOC_CONFIG_FILENAME,
+        message: `Configured codeRoot does not exist or is not a directory: ${rawPath}`
+      });
+      continue;
+    }
+
+    resolvedRoots.push({
+      name,
+      configuredPath: rawPath,
+      absolutePath: safeRealpath(absolutePath)
+    });
+  }
+
+  return resolvedRoots;
+}
+
+function resolveMetaPath(
+  rootDir: string,
+  llmdocDir: string,
+  config: LlmdocConfig | null
+): { metaPath: string; metaLocation: "tracked" | "local"; metaDisplayPath: string } {
+  const location = config?.state?.location ?? "tracked";
+  if (location === "local") {
+    const localPref = config?.state?.localPath?.trim() || "project";
+    let metaPath: string;
+    if (localPref === "user") {
+      const stateBase = process.env.XDG_STATE_HOME?.trim() || path.join(os.homedir(), ".local", "state");
+      const workspaceId = crypto
+        .createHash("sha256")
+        .update(`${safeRealpath(rootDir)}\0${safeRealpath(llmdocDir)}`)
+        .digest("hex")
+        .slice(0, 16);
+      metaPath = path.join(stateBase, "llmdoc", workspaceId, "meta.json");
+    } else if (localPref === "project") {
+      metaPath = path.join(rootDir, ".llmdoc-tmp", "meta.json");
+    } else {
+      metaPath = path.isAbsolute(localPref) ? path.resolve(localPref) : path.resolve(rootDir, localPref);
+    }
+    const metaDisplayPath = isPathInsideDir(rootDir, metaPath) ? repoPath(rootDir, metaPath) : metaPath;
+    return { metaPath, metaLocation: "local", metaDisplayPath };
+  }
+
+  const metaPath = path.join(llmdocDir, "meta.json");
+  const metaDisplayPath = isPathInsideDir(rootDir, metaPath) ? repoPath(rootDir, metaPath) : metaPath;
+  return { metaPath, metaLocation: "tracked", metaDisplayPath };
+}
+
+function scanDocuments(llmdocDir: string, preloadIssues: ValidationIssue[]): ParsedDocument[] {
   const results: ParsedDocument[] = [];
+  const docsRealPath = fs.realpathSync(llmdocDir);
 
   walk(llmdocDir, (absolutePath) => {
-    const repoRelativePath = repoPath(rootDir, absolutePath);
+    const llmdocRelativePath = repoPath(llmdocDir, absolutePath);
+    const displayRepoPath = `llmdoc/${llmdocRelativePath}`;
+
+    let resolvedAbs: string;
+    try {
+      resolvedAbs = fs.realpathSync(absolutePath);
+    } catch {
+      return;
+    }
+    if (!isWithinRoot(docsRealPath, resolvedAbs)) {
+      preloadIssues.push({
+        severity: "error",
+        code: "file.symlink.escape",
+        path: displayRepoPath,
+        message: `Path escapes the docs directory through a symlink: ${displayRepoPath}`
+      });
+      return;
+    }
+
     if (!absolutePath.endsWith(".mdx")) {
       if (absolutePath !== path.join(llmdocDir, "meta.json")) {
         preloadIssues.push({
           severity: "error",
           code: "file.extension.invalid",
-          path: repoRelativePath,
+          path: displayRepoPath,
           message: "llmdoc/ allows only .mdx documents and one root-level meta.json file."
         });
       }
@@ -85,19 +313,18 @@ function scanDocuments(rootDir: string, llmdocDir: string, preloadIssues: Valida
       preloadIssues.push({
         severity: "error",
         code: "frontmatter.parse",
-        path: repoRelativePath,
+        path: displayRepoPath,
         message: `Front matter parse failed: ${(error as Error).message}`
       });
       return;
     }
     const frontmatter = parsed.data as DocumentFrontmatter;
-    const llmdocPath = repoPath(llmdocDir, absolutePath);
-    const segments = llmdocPath.split("/");
+    const segments = llmdocRelativePath.split("/");
 
     results.push({
       absolutePath,
-      repoPath: repoPath(rootDir, absolutePath),
-      llmdocPath,
+      repoPath: displayRepoPath,
+      llmdocPath: llmdocRelativePath,
       topic: segments.length > 1 ? segments[0] ?? null : null,
       basename: path.basename(absolutePath),
       frontmatter,
@@ -121,13 +348,23 @@ function walk(currentDir: string, visitor: (absolutePath: string) => void): void
     const absolutePath = path.join(currentDir, entry.name);
     if (entry.isDirectory()) {
       walk(absolutePath, visitor);
-    } else if (entry.isFile()) {
-      visitor(absolutePath);
+    } else if (entry.isFile() || entry.isSymbolicLink()) {
+      let stat: fs.Stats;
+      try {
+        stat = fs.statSync(absolutePath);
+      } catch {
+        continue;
+      }
+      if (stat.isDirectory()) {
+        walk(absolutePath, visitor);
+      } else if (stat.isFile()) {
+        visitor(absolutePath);
+      }
     }
   }
 }
 
-function loadMeta(metaPath: string, preloadIssues: ValidationIssue[]): MetaLedger | null {
+function loadMeta(metaPath: string, metaDisplayPath: string, preloadIssues: ValidationIssue[]): MetaLedger | null {
   if (!fs.existsSync(metaPath)) {
     return null;
   }
@@ -138,7 +375,7 @@ function loadMeta(metaPath: string, preloadIssues: ValidationIssue[]): MetaLedge
     preloadIssues.push({
       severity: "error",
       code: "meta.parse",
-      path: "llmdoc/meta.json",
+      path: metaDisplayPath,
       message: `meta.json parse failed: ${(error as Error).message}`
     });
     return null;
@@ -149,7 +386,7 @@ function loadMeta(metaPath: string, preloadIssues: ValidationIssue[]): MetaLedge
       preloadIssues.push({
         severity: "error",
         code: "meta.invalid",
-        path: "llmdoc/meta.json",
+        path: metaDisplayPath,
         message: `Invalid meta.json: ${error}`
       });
     }
@@ -162,14 +399,23 @@ export function validateWorkspace(workspace: WorkspaceData): ValidationIssue[] {
   const issues: ValidationIssue[] = [...workspace.preloadIssues];
   issues.push(...workspace.llmdocConfig.issues);
   const seenDocPaths = new Set<string>();
+  const ignoreEngines = new Map<string, IgnoreEngine>();
+  const getIgnoreEngine = (codeRoot: ResolvedCodeRoot): IgnoreEngine => {
+    const existing = ignoreEngines.get(codeRoot.absolutePath);
+    if (existing) {
+      return existing;
+    }
+    const created = createIgnoreEngine(codeRoot.absolutePath, { llmdocDir: workspace.llmdocDir });
+    ignoreEngines.set(codeRoot.absolutePath, created);
+    return created;
+  };
 
   if (!workspace.meta) {
     issues.push({
       severity: "error",
       code: "meta.missing",
-      path: "llmdoc/meta.json",
-      message:
-        "llmdoc/meta.json is missing. Run `npx -y @tokenroll/llmdoc init-state` to create the ledger (create the initial Git commit first if the repository has no commits)."
+      path: workspace.metaDisplayPath,
+      message: `${workspace.metaDisplayPath} is missing. Run \`llmdoc init-state\` to create the ledger.`
     });
   }
 
@@ -285,7 +531,7 @@ export function validateWorkspace(workspace: WorkspaceData): ValidationIssue[] {
     }
 
     for (const codeRef of document.codeRefs) {
-      const normalized = validateRepoPath(workspace.rootDir, codeRef.path);
+      const normalized = validateCodeRefPath(workspace, codeRef.path);
       if (!normalized.ok) {
         issues.push({
           severity: "error",
@@ -304,7 +550,7 @@ export function validateWorkspace(workspace: WorkspaceData): ValidationIssue[] {
     }
 
     for (const codePath of document.frontmatter.code?.paths ?? []) {
-      const normalized = validateCodePathPattern(workspace.rootDir, codePath);
+      const normalized = validateCodePathPattern(workspace, codePath);
       if (!normalized.ok) {
         issues.push({
           severity: "error",
@@ -321,7 +567,7 @@ export function validateWorkspace(workspace: WorkspaceData): ValidationIssue[] {
         });
       } else if (
         normalized.isGlob &&
-        !globMatchesExistingFile(workspace.rootDir, normalized.absolutePath, normalized.normalized)
+        !globMatchesExistingFile(normalized.codeRoot, normalized.absolutePath, normalized.normalized, getIgnoreEngine(normalized.codeRoot))
       ) {
         issues.push({
           severity: "error",
@@ -354,19 +600,6 @@ export function validateWorkspace(workspace: WorkspaceData): ValidationIssue[] {
   }
 
   if (workspace.meta) {
-    // shallow clone 中历史 commit 天然不可达:revision 缺失降级为 warning,
-    // 否则任何 fetch-depth:1 的 CI 都会误报陈旧。
-    const shallow = isShallowRepository(workspace.rootDir);
-    const revisionSeverity = shallow ? ("warning" as const) : ("error" as const);
-    const shallowHint = shallow ? " (shallow clone; use fetch-depth: 0 or git fetch --unshallow for complete validation)" : "";
-    if (!gitCommitExists(workspace.rootDir, workspace.meta.baseline.revision)) {
-      issues.push({
-        severity: revisionSeverity,
-        code: "meta.baseline.revision.missing",
-        path: "llmdoc/meta.json",
-        message: `baseline.revision does not exist in current Git history: ${workspace.meta.baseline.revision}${shallowHint}`
-      });
-    }
     const metaPaths = Object.keys(workspace.meta.documents).sort();
     const docPaths = [...seenDocPaths].sort();
 
@@ -381,23 +614,46 @@ export function validateWorkspace(workspace: WorkspaceData): ValidationIssue[] {
       }
     }
 
-    for (const metaPath of metaPaths) {
-      if (!seenDocPaths.has(metaPath)) {
+    for (const metaDocPath of metaPaths) {
+      if (!seenDocPaths.has(metaDocPath)) {
         issues.push({
           severity: "error",
           code: "meta.entry.orphaned",
-          path: `llmdoc/${metaPath}`,
+          path: `llmdoc/${metaDocPath}`,
           message: "meta.json contains an orphan documents entry."
         });
       }
-      const revision = workspace.meta.documents[metaPath]?.validatedRevision;
-      if (revision && !gitCommitExists(workspace.rootDir, revision)) {
+    }
+
+    // Legacy v3 ledger compatibility: only check Git revisions for v3 ledgers.
+    // v4 ledgers use content digests as first-class state; hintRevision is optional and NEVER errors.
+    if (workspace.meta.schema === "llmdoc.meta/v3") {
+      const hasGit = isGitRepository(workspace.rootDir);
+      const shallow = hasGit ? isShallowRepository(workspace.rootDir) : false;
+      const revisionSeverity = !hasGit || shallow ? ("warning" as const) : ("error" as const);
+      const hint = !hasGit
+        ? " (non-Git workspace; run `llmdoc finalize --all` to upgrade meta.json to llmdoc.meta/v4)"
+        : shallow
+          ? " (shallow clone; use fetch-depth: 0 or git fetch --unshallow for complete validation)"
+          : "";
+      if (!hasGit || !gitCommitExists(workspace.rootDir, workspace.meta.baseline.revision)) {
         issues.push({
           severity: revisionSeverity,
-          code: "meta.document.revision.missing",
-          path: `llmdoc/${metaPath}`,
-          message: `validatedRevision does not exist in current Git history: ${revision}${shallowHint}`
+          code: "meta.baseline.revision.missing",
+          path: workspace.metaDisplayPath,
+          message: `baseline.revision does not exist in current Git history: ${workspace.meta.baseline.revision}${hint}`
         });
+      }
+      for (const metaDocPath of metaPaths) {
+        const revision = workspace.meta.documents[metaDocPath]?.validatedRevision;
+        if (revision && (!hasGit || !gitCommitExists(workspace.rootDir, revision))) {
+          issues.push({
+            severity: revisionSeverity,
+            code: "meta.document.revision.missing",
+            path: `llmdoc/${metaDocPath}`,
+            message: `validatedRevision does not exist in current Git history: ${revision}${hint}`
+          });
+        }
       }
     }
   }
@@ -440,29 +696,34 @@ function validateLlmdocRelativePath(input: string): { ok: true; value: string } 
   }
 }
 
-function validateRepoPath(
-  rootDir: string,
+function validateCodeRefPath(
+  workspace: WorkspaceData,
   input: string
 ): { ok: true; absolutePath: string; normalized: string } | { ok: false; message: string } {
   try {
-    const normalized = normalizeRepoRelativePath(input);
-    const absolutePath = resolveInsideRoot(rootDir, normalized);
-    return { ok: true, absolutePath, normalized };
+    const resolved = resolveCodePathInWorkspace(workspace, input);
+    return { ok: true, absolutePath: resolved.absolutePath, normalized: resolved.normalized };
   } catch (error) {
     return { ok: false, message: (error as Error).message };
   }
 }
 
 function validateCodePathPattern(
-  rootDir: string,
+  workspace: WorkspaceData,
   input: string
-): { ok: true; absolutePath: string; normalized: string; isGlob: boolean } | { ok: false; message: string } {
+): { ok: true; absolutePath: string; normalized: string; isGlob: boolean; codeRoot: ResolvedCodeRoot } | { ok: false; message: string } {
   try {
     const normalized = normalizeRepoRelativePath(input);
     const glob = isGlob(normalized);
     if (!glob) {
-      const absolutePath = resolveInsideRoot(rootDir, normalized);
-      return { ok: true, absolutePath, normalized, isGlob: false };
+      const resolved = resolveCodePathInWorkspace(workspace, normalized);
+      return {
+        ok: true,
+        absolutePath: resolved.absolutePath,
+        normalized: resolved.normalized,
+        isGlob: false,
+        codeRoot: resolved.codeRoot
+      };
     }
 
     const staticPrefixSegments: string[] = [];
@@ -473,25 +734,60 @@ function validateCodePathPattern(
       staticPrefixSegments.push(segment);
     }
     const staticPrefix = staticPrefixSegments.join("/");
-    const prefix = staticPrefix || ".";
-    const absolutePath = prefix === "." ? rootDir : resolveInsideRoot(rootDir, prefix);
-    return { ok: true, absolutePath, normalized, isGlob: true };
+    if (!staticPrefix) {
+      const defaultRoot = workspace.codeRoots.find((root) => root.name === null) ?? {
+        name: null,
+        configuredPath: ".",
+        absolutePath: workspace.rootDir
+      };
+      return {
+        ok: true,
+        absolutePath: defaultRoot.absolutePath,
+        normalized,
+        isGlob: true,
+        codeRoot: defaultRoot
+      };
+    }
+    const resolved = resolveCodePathInWorkspace(workspace, staticPrefix);
+    return {
+      ok: true,
+      absolutePath: resolved.absolutePath,
+      normalized,
+      isGlob: true,
+      codeRoot: resolved.codeRoot
+    };
   } catch (error) {
     return { ok: false, message: (error as Error).message };
   }
 }
 
-function globMatchesExistingFile(rootDir: string, staticPrefixPath: string, pattern: string): boolean {
+function globMatchesExistingFile(
+  codeRoot: ResolvedCodeRoot,
+  staticPrefixPath: string,
+  pattern: string,
+  ignoreEngine: IgnoreEngine
+): boolean {
+  const prefix = codeRoot.name ? `${codeRoot.name}/` : "";
   const pending = [staticPrefixPath];
 
   while (pending.length > 0) {
     const currentPath = pending.pop()!;
-    const stat = fs.lstatSync(currentPath);
+    let stat: fs.Stats;
+    try {
+      stat = fs.lstatSync(currentPath);
+    } catch {
+      continue;
+    }
     if (stat.isSymbolicLink()) {
       continue;
     }
+    const localRel = repoPath(codeRoot.absolutePath, currentPath);
     if (stat.isFile()) {
-      if (matchesCodePathPattern(pattern, repoPath(rootDir, currentPath))) {
+      if (localRel && ignoreEngine.isIgnored(localRel, false)) {
+        continue;
+      }
+      const fullRel = `${prefix}${localRel}`;
+      if (matchesCodePathPattern(pattern, fullRel)) {
         return true;
       }
       continue;
@@ -500,16 +796,39 @@ function globMatchesExistingFile(rootDir: string, staticPrefixPath: string, patt
       continue;
     }
 
-    for (const entry of fs.readdirSync(currentPath, { withFileTypes: true })) {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(currentPath, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
       if (entry.isSymbolicLink()) {
         continue;
       }
-      if (entry.isDirectory() && [".git", ".llmdoc-tmp", "node_modules"].includes(entry.name)) {
+      const childPath = path.join(currentPath, entry.name);
+      const childLocalRel = localRel ? `${localRel}/${entry.name}` : entry.name;
+      if (entry.isDirectory() && ignoreEngine.shouldPruneDirectory(childLocalRel)) {
         continue;
       }
-      pending.push(path.join(currentPath, entry.name));
+      pending.push(childPath);
     }
   }
 
   return false;
+}
+
+function isPathInsideDir(parentDir: string, candidatePath: string): boolean {
+  const parentReal = safeRealpath(parentDir);
+  const candidateReal = safeRealpath(candidatePath);
+  return isWithinRoot(parentReal, candidateReal);
+}
+
+function safeRealpath(targetPath: string): string {
+  const resolved = path.resolve(targetPath);
+  try {
+    return fs.realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
 }

@@ -6,7 +6,7 @@ allowed-tools: Read, Glob, Grep, Bash, Write, Edit, WebSearch, WebFetch
 
 # /llmdoc
 
-Use the CLI to retrieve durable architecture, constraints, and working agreements from V3 `llmdoc/` projects. Run commands as `npx -y @tokenroll/llmdoc <cmd>`.
+Use the CLI to retrieve durable architecture, constraints, and working agreements from `llmdoc/` workspaces (Git or non-Git). Run commands with the installed `llmdoc <cmd>` binary.
 
 ## Retrieval Gate
 
@@ -22,32 +22,31 @@ Apply this gate before the first discovery action of a task, and again whenever 
 
 The gate guards broad native discovery: recursive or cross-directory exploration with Read, Grep, Glob, or shell outside a working set llmdoc has already narrowed.
 
-Once llmdoc has narrowed that working set, native tools own the exact facts — source text, line numbers, test behavior, counts, git state. The knowledge surface deliberately does not duplicate those.
+Once llmdoc has narrowed that working set, native tools own the exact facts — source text, line numbers, test behavior, counts, workspace state. The knowledge surface deliberately does not duplicate those.
 
 These entry points are alternatives, not a sequence. Stop as soon as the task has enough context; that permission applies after choosing an entry point, never instead of choosing one.
 
-`status` and `delta` are not retrieval. Use them to assess staleness or to prepare `/llmdoc:update`, where `delta` decides light vs deep.
+`status` and `delta` are not retrieval. Use them to assess content-digest staleness or to prepare `/llmdoc:update`, where `delta` decides light vs deep.
 
 ## CLI Invocation
 
-`@tokenroll/llmdoc` is external tooling, not a project dependency. `-y` lets a missing package resolve into the npm cache without a prompt.
+Invoke the locally installed fork CLI directly as `llmdoc <cmd>`.
 
-- Never add it to the served project's `package.json` or lockfile.
-- Pin in the package spec when reproducibility matters: `npx -y @tokenroll/llmdoc@<version> <cmd>`.
-- Never call a bare `npx llmdoc`; that name resolves to an unrelated package.
-- If the CLI stays unavailable, report the degraded path, then continue with narrowly scoped native tools.
+- Never add llmdoc to the project's `package.json` or lockfile, and never invoke `npx llmdoc` or upstream npm packages.
+- Use `--root` / `LLMDOC_ROOT` or `--docs-dir` / `LLMDOC_DOCS_DIR` for external roots.
+- If `llmdoc` is unavailable on PATH, note the degraded path and continue with scoped native tools.
 
 ## Operating Rules
 
-- Preserve and reuse `LLMDOC_STATE` across continuation; do not replay prior reads unless evidence changed or the task moved.
-- Temporary investigation notes belong in `.llmdoc-tmp/`, not in stable docs.
-- Stable `llmdoc/` writes belong to `recorder`; `llmdoc/meta.json` changes go through the CLI only (`new`, `adopt`, `mv`, `fingerprint`, `commit`). A valid `.mdx` that already exists on disk gets its ledger entry via `adopt <path...>` — never the delete-and-recreate dance through `new`.
-- Before non-trivial edits, align with the user.
-- If `llmdoc/` does not exist, suggest `/llmdoc:init`; do not fabricate the knowledge surface ad hoc.
-- Once code is mostly done with no known major issues, delegate needed `/llmdoc:update` work alongside verification; include later fixes and finalize only after verification passes.
-- For topology or routing work, read [Knowledge Topology](references/knowledge-topology.md).
-- For SessionStart reminders or document preload, read [Startup Configuration](references/startup-config.md).
-- Never suggest `/llmdoc:upgrade`; it runs only when the user asks for it by name.
+- Reuse `LLMDOC_STATE` across continuation; do not replay prior reads unless evidence or scope changed.
+- Put scratch notes in `.llmdoc-tmp/`, not stable docs.
+- Stable `llmdoc/` writes belong to `recorder`; ledger updates (`meta.json`, tracked or local) go through CLI only (`new`, `adopt`, `mv`, `fingerprint`, `finalize`, `commit`). Register existing `.mdx` files via `adopt <path...>`, never recreate through `new`.
+- Align with the user before non-trivial edits.
+- If `llmdoc/` does not exist, suggest `/llmdoc:init`; do not fabricate docs ad hoc.
+- Delegate needed `/llmdoc:update` alongside verification; finalize only after verification passes.
+- For topology/routing, read [Knowledge Topology](references/knowledge-topology.md).
+- For SessionStart, preload, local state, or multi-repo roots, read [Startup Configuration](references/startup-config.md).
+- Never suggest `/llmdoc:upgrade` unless explicitly requested.
 
 ## Reflection Gate
 

@@ -1,21 +1,50 @@
 import fs from "node:fs";
 import path from "node:path";
 
+import type { WorkspaceResolutionOptions } from "../types.js";
 import { CliError } from "./errors.js";
 
-export function findProjectRoot(startDir: string): string {
-  const found = findProjectRootOrNull(startDir);
+const CONFIG_FILE = "llmdoc.config.json";
+
+export function resolveExplicitRoot(options?: WorkspaceResolutionOptions): string | null {
+  const raw = options?.root?.trim() || process.env.LLMDOC_ROOT?.trim() || "";
+  if (!raw) {
+    return null;
+  }
+  const resolved = path.resolve(raw);
+  if (!isDirectory(resolved)) {
+    throw new CliError(`Specified project root does not exist or is not a directory: ${raw}`, 2);
+  }
+  return resolved;
+}
+
+export function resolveExplicitDocsDir(startDir: string, options?: WorkspaceResolutionOptions): string | null {
+  const raw = options?.docsDir?.trim() || process.env.LLMDOC_DOCS_DIR?.trim() || "";
+  if (!raw) {
+    return null;
+  }
+  return path.isAbsolute(raw) ? path.resolve(raw) : path.resolve(startDir, raw);
+}
+
+export function findProjectRoot(startDir: string, options?: WorkspaceResolutionOptions): string {
+  const found = findProjectRootOrNull(startDir, options);
   if (found) {
     return found;
   }
-  throw new CliError("No llmdoc/ directory was found. Run this command inside an llmdoc repository.", 2);
+  throw new CliError("No llmdoc/ directory or llmdoc.config.json was found. Run this command inside an llmdoc workspace.", 2);
 }
 
-// new 是唯一允许在 llmdoc/ 尚不存在时运行的结构改写命令。
-// 首次创建严格锁定最近 Git 根；无 Git 但已有 llmdoc/ 时保留原有兼容路径。
-export function findProjectRootForNew(startDir: string): string {
+/**
+ * Project root discovery for `new` (allows initializing a workspace even without Git):
+ *   --root / LLMDOC_ROOT > ancestor llmdoc.config.json > ancestor llmdoc/ > nearest .git root > cwd
+ */
+export function findProjectRootForNew(startDir: string, options?: WorkspaceResolutionOptions): string {
   const start = path.resolve(startDir);
-  const existingWorkspace = findProjectRootOrNull(start);
+  const explicit = resolveExplicitRoot(options);
+  if (explicit) {
+    return explicit;
+  }
+  const existingWorkspace = findProjectRootOrNull(start, options);
   if (existingWorkspace) {
     return existingWorkspace;
   }
@@ -23,35 +52,43 @@ export function findProjectRootForNew(startDir: string): string {
   if (gitRoot) {
     return gitRoot;
   }
-  throw new CliError("No Git repository was found. Run `git init` before `llmdoc new`.", 2);
+  return start;
 }
 
-export function findProjectRootOrNull(startDir: string): string | null {
+/**
+ * Project root discovery priority (never truncated by nested sub-repo `.git`):
+ *   1. --root / LLMDOC_ROOT
+ *   2. Walk up for `llmdoc.config.json` (crossing nested `.git`)
+ *   3. Walk up for `llmdoc/` (crossing nested `.git`)
+ *   4. When --docs-dir / LLMDOC_DOCS_DIR is explicitly provided: nearest `.git` root or startDir
+ */
+export function findProjectRootOrNull(startDir: string, options?: WorkspaceResolutionOptions): string | null {
   const start = path.resolve(startDir);
-  const gitRoot = findNearestGitRootOrNull(start);
-
-  if (gitRoot) {
-    return isDirectory(path.join(gitRoot, "llmdoc")) ? gitRoot : null;
+  const explicit = resolveExplicitRoot(options);
+  if (explicit) {
+    return explicit;
   }
 
-  // Git 是 llmdoc 有效性与 delta 语义的基础；这里只为仓库初始化前的
-  // 临时目录保留兼容回退。存在 Git 边界时绝不能越界命中同级仓库。
-  let current = start;
-  while (true) {
-    if (isDirectory(path.join(current, "llmdoc"))) {
-      return current;
-    }
-
-    const parent = path.dirname(current);
-    if (parent === current) {
-      return null;
-    }
-    current = parent;
+  const configRoot = walkUpForFile(start, CONFIG_FILE);
+  if (configRoot) {
+    return configRoot;
   }
+
+  const llmdocRoot = walkUpForLlmdocDir(start);
+  if (llmdocRoot) {
+    return llmdocRoot;
+  }
+
+  const explicitDocsDir = resolveExplicitDocsDir(start, options);
+  if (explicitDocsDir) {
+    return findNearestGitRootOrNull(start) ?? start;
+  }
+
+  return null;
 }
 
-function findNearestGitRootOrNull(startDir: string): string | null {
-  let current = startDir;
+export function findNearestGitRootOrNull(startDir: string): string | null {
+  let current = path.resolve(startDir);
   while (true) {
     if (fs.existsSync(path.join(current, ".git"))) {
       return current;
@@ -64,9 +101,73 @@ function findNearestGitRootOrNull(startDir: string): string | null {
   }
 }
 
+function walkUpForFile(startDir: string, fileName: string): string | null {
+  let current = startDir;
+  while (true) {
+    if (isFile(path.join(current, fileName))) {
+      return current;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return null;
+    }
+    current = parent;
+  }
+}
+
+function walkUpForLlmdocDir(startDir: string): string | null {
+  let current = startDir;
+  let crossedGitBoundary = false;
+  while (true) {
+    const candidate = path.join(current, "llmdoc");
+    if (isValidLlmdocDirCandidate(candidate, startDir, crossedGitBoundary)) {
+      return current;
+    }
+    if (fs.existsSync(path.join(current, ".git"))) {
+      crossedGitBoundary = true;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return null;
+    }
+    current = parent;
+  }
+}
+
+function isValidLlmdocDirCandidate(candidateDir: string, startDir: string, crossedGitBoundary: boolean): boolean {
+  if (!isDirectory(candidateDir)) {
+    return false;
+  }
+  const insideCandidate = startDir === candidateDir || startDir.startsWith(`${candidateDir}${path.sep}`);
+  if (!insideCandidate && !crossedGitBoundary) {
+    return true;
+  }
+  // When walking above a nested `.git` boundary or when startDir is inside an ancestor named `llmdoc`,
+  // require genuine llmdoc knowledge markers (meta.json or .mdx) and reject a Git repo merely named `llmdoc`.
+  if (fs.existsSync(path.join(candidateDir, ".git"))) {
+    return false;
+  }
+  if (fs.existsSync(path.join(candidateDir, "meta.json"))) {
+    return true;
+  }
+  try {
+    return fs.readdirSync(candidateDir).some((name) => name.endsWith(".mdx"));
+  } catch {
+    return false;
+  }
+}
+
 function isDirectory(candidate: string): boolean {
   try {
     return fs.statSync(candidate).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function isFile(candidate: string): boolean {
+  try {
+    return fs.statSync(candidate).isFile();
   } catch {
     return false;
   }

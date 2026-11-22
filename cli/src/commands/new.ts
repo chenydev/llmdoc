@@ -3,12 +3,13 @@ import path from "node:path";
 
 import { parseDocTargetShape, assertDocKindMatchesShape, assertDocumentKind } from "../lib/doc-shape.js";
 import { CliError } from "../lib/errors.js";
-import { ensureDirectory, findProjectRootForNew, normalizeRepoRelativePath, resolveInsideRoot } from "../lib/fs.js";
+import { ensureDirectory, findProjectRootForNew, normalizeRepoRelativePath } from "../lib/fs.js";
 import { packageRootFromImport } from "../lib/package-root.js";
-import { loadWorkspace } from "../lib/workspace.js";
-import { DocumentKind } from "../types.js";
+import { writeMeta } from "../lib/state.js";
+import { loadWorkspace, resolveDocPathInWorkspace, resolveWorkspaceLayout } from "../lib/workspace.js";
+import { DocumentKind, WorkspaceResolutionOptions } from "../types.js";
 
-interface NewOptions {
+interface NewOptions extends WorkspaceResolutionOptions {
   cwd: string;
   path: string;
   kind: DocumentKind;
@@ -17,12 +18,15 @@ interface NewOptions {
 }
 
 export function runNew(options: NewOptions): unknown {
-  const rootDir = findProjectRootForNew(options.cwd);
+  const rootDir = findProjectRootForNew(options.cwd, options);
+  const layout = resolveWorkspaceLayout(rootDir, { docsDir: options.docsDir, allowMissingDocsDir: true });
   const repoRelativePath = normalizeDocDestination(options.path);
   const kind = assertDocumentKind(options.kind);
   const shape = parseDocTargetShape(repoRelativePath);
   assertDocKindMatchesShape(shape);
-  const absolutePath = resolveInsideRoot(rootDir, repoRelativePath, { allowMissing: true });
+
+  fs.mkdirSync(layout.llmdocDir, { recursive: true });
+  const absolutePath = resolveDocPathInWorkspace(layout.llmdocDir, shape.llmdocPath, { allowMissing: true });
   if (fs.existsSync(absolutePath)) {
     throw new CliError(`Target already exists: ${repoRelativePath}`);
   }
@@ -37,21 +41,19 @@ export function runNew(options: NewOptions): unknown {
     .replace("__KIND__", () => kind)
     .replace("__TITLE__", () => title);
 
-  const metaExists = fs.existsSync(path.join(rootDir, "llmdoc", "meta.json"));
+  const metaExists = fs.existsSync(layout.metaPath);
   fs.writeFileSync(absolutePath, content);
-  syncMetaEntry(rootDir, shape.llmdocPath);
+  syncMetaEntry(rootDir, shape.llmdocPath, options.docsDir);
 
   if (options.json) {
     return {
       created: repoRelativePath,
-      next: metaExists
-        ? null
-        : "If HEAD has no commit, create the initial Git commit, then run `npx -y @tokenroll/llmdoc init-state`."
+      next: metaExists ? null : "Run `llmdoc init-state` to create the ledger."
     };
   }
   return metaExists
     ? `created: ${repoRelativePath}`
-    : `created: ${repoRelativePath}\nnext: If the repository has no commit, create the initial Git commit, then run \`npx -y @tokenroll/llmdoc init-state\` to create the ledger.`;
+    : `created: ${repoRelativePath}\nnext: Run \`llmdoc init-state\` to create the ledger.`;
 }
 
 function normalizeDocDestination(input: string): string {
@@ -67,16 +69,22 @@ function readTemplate(): string {
   return fs.readFileSync(path.join(packageRoot, "templates", "doc.mdx"), "utf8");
 }
 
-function syncMetaEntry(rootDir: string, llmdocPath: string): void {
-  const workspace = loadWorkspace(rootDir);
+function syncMetaEntry(rootDir: string, llmdocPath: string, docsDir?: string): void {
+  const workspace = loadWorkspace(rootDir, { docsDir });
   if (!workspace.meta) {
     return;
   }
   if (!workspace.meta.documents[llmdocPath]) {
-    // 新文档尚未经过任何验证,登记为 null;validatedRevision 只能由 fingerprint 在验证后写入。
-    workspace.meta.documents[llmdocPath] = {
-      validatedRevision: null
-    };
-    fs.writeFileSync(workspace.metaPath, `${JSON.stringify(workspace.meta, null, 2)}\n`);
+    if (workspace.meta.schema === "llmdoc.meta/v4") {
+      workspace.meta.documents[llmdocPath] = {
+        codeDigest: null,
+        hintRevision: null
+      };
+    } else {
+      workspace.meta.documents[llmdocPath] = {
+        validatedRevision: null
+      };
+    }
+    writeMeta(workspace.metaPath, workspace.meta);
   }
 }

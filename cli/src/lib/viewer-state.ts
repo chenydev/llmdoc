@@ -5,11 +5,13 @@ import { readRepositoryRevisionHealth } from "./repository-health.js";
 import {
   analyzeDelta,
   computeGrowthState,
+  getMetaBaselineDigest,
+  getMetaBaselineRevision,
   type DeltaState,
   type GrowthState
 } from "./state.js";
 import { loadWorkspace, validateWorkspace } from "./workspace.js";
-import type { DocumentKind, ParsedDocument, ValidationIssue, WorkspaceData } from "../types.js";
+import type { DocumentKind, ParsedDocument, ValidationIssue, WorkspaceData, WorkspaceResolutionOptions } from "../types.js";
 
 export type ViewerNodeStatus = "fresh" | "needs-review" | "impacted" | "dirty";
 export type ViewerEdgeType = "requires" | "related" | "link";
@@ -42,6 +44,8 @@ export interface ViewerStateDto {
   generatedAt: string;
   baseline: {
     revision: string | null;
+    surfaceDigest: string | null;
+    trackingMode: "git-hybrid" | "filesystem";
     headRevision: string | null;
     /** 原始 git commit 落后数，保留既有 API 语义。 */
     behindHead: number | null;
@@ -82,8 +86,12 @@ const EDGE_PRIORITY: Readonly<Record<ViewerEdgeType, number>> = {
   link: 1
 };
 
-export function loadViewerState(rootDir: string, generatedAt = new Date().toISOString()): ViewerStateDto {
-  const workspace = loadWorkspace(rootDir);
+export function loadViewerState(
+  rootDir: string,
+  generatedAt = new Date().toISOString(),
+  options?: Pick<WorkspaceResolutionOptions, "docsDir">
+): ViewerStateDto {
+  const workspace = loadWorkspace(rootDir, options);
   const delta = analyzeDelta(workspace);
   return projectViewerState({
     workspace,
@@ -129,11 +137,16 @@ export function projectViewerState(input: ViewerStateProjectionInput): ViewerSta
     })
     .sort((left, right) => compareText(left.path, right.path));
 
+  const baselineRevision = getMetaBaselineRevision(workspace.meta);
+  const baselineDigest = getMetaBaselineDigest(workspace.meta);
+
   return {
     repository: path.basename(workspace.rootDir),
     generatedAt,
     baseline: {
-      revision: workspace.meta?.baseline.revision ?? null,
+      revision: baselineRevision,
+      surfaceDigest: baselineDigest,
+      trackingMode: delta.trackingMode,
       headRevision: delta.git.headRevision,
       behindHead: delta.git.baselineBehindHead,
       relevantBehindHead: revisionHealth.relevantCommitsBehindHead,
@@ -205,8 +218,9 @@ export function buildViewerEdges(
 export function readViewerRevisionHealth(workspace: WorkspaceData, delta: DeltaState): ViewerRevisionHealth {
   const health = readRepositoryRevisionHealth(
     workspace.rootDir,
-    workspace.meta?.baseline.revision ?? null,
-    delta.git
+    getMetaBaselineRevision(workspace.meta),
+    delta.git,
+    workspace.llmdocDir
   );
   return {
     relevantCommitsBehindHead: health.relevantCommitsBehindHead,

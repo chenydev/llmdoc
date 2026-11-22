@@ -12,7 +12,12 @@ export interface MoveMapping {
 
 export function updateDocumentForMove(document: ParsedDocument, mapping: MoveMapping[]): string {
   const frontmatter: DocumentFrontmatter = structuredClone(document.frontmatter);
-  frontmatter.relations = updateRelations(frontmatter.relations, mapping);
+  const nextRelations = updateRelations(frontmatter.relations, mapping);
+  if (nextRelations) {
+    frontmatter.relations = nextRelations;
+  } else {
+    delete frontmatter.relations;
+  }
 
   let body = document.body;
   body = rewriteMarkdownLinks({

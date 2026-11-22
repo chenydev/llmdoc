@@ -507,6 +507,37 @@
             "null"
           ]
         },
+        "baselineDigest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "trackingMode": {
+          "type": "string",
+          "enum": [
+            "git-hybrid",
+            "filesystem"
+          ]
+        },
+        "metaSchema": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "llmdoc.meta/v4",
+            "llmdoc.meta/v3",
+            null
+          ]
+        },
+        "metaLocation": {
+          "type": "string",
+          "enum": [
+            "tracked",
+            "local"
+          ]
+        },
         "head": {
           "type": [
             "string",
@@ -610,6 +641,13 @@
             "deep"
           ]
         },
+        "trackingMode": {
+          "type": "string",
+          "enum": [
+            "git-hybrid",
+            "filesystem"
+          ]
+        },
         "reasons": {
           "type": "array",
           "items": {
@@ -636,6 +674,13 @@
             "properties": {
               "path": {
                 "$ref": "#/$defs/path"
+              },
+              "changedPaths": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
               },
               "changedCommittedPaths": {
                 "type": "array",
@@ -697,6 +742,7 @@
         "status",
         "updateAll",
         "updated",
+        "baselineDigest",
         "baselineRevision"
       ],
       "properties": {
@@ -714,9 +760,24 @@
             "minLength": 1
           }
         },
+        "baselineDigest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "baselineRevision": {
-          "type": "string",
-          "minLength": 1
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dirtyPaths": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
         }
       }
     },
@@ -976,8 +1037,11 @@
       "additionalProperties": false,
       "required": [
         "status",
+        "schema",
         "documents",
+        "baselineDigest",
         "baselineRevision",
+        "metaPath",
         "next"
       ],
       "properties": {
@@ -985,16 +1049,95 @@
           "type": "string",
           "const": "success"
         },
+        "schema": {
+          "type": "string",
+          "const": "llmdoc.meta/v4"
+        },
         "documents": {
           "type": "integer",
           "minimum": 0
         },
+        "baselineDigest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "baselineRevision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metaPath": {
           "type": "string",
           "minLength": 1
         },
         "next": {
           "type": "string"
+        }
+      }
+    },
+    "finalize": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "updateAll",
+        "updated",
+        "removedOrphans",
+        "baselineDigest",
+        "baselineRevision",
+        "metaPath",
+        "dirtyPaths"
+      ],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "success",
+            "no_change"
+          ]
+        },
+        "updateAll": {
+          "type": "boolean"
+        },
+        "updated": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "removedOrphans": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "baselineDigest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "baselineRevision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metaPath": {
+          "type": "string",
+          "minLength": 1
+        },
+        "dirtyPaths": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
         }
       }
     },
@@ -1030,6 +1173,19 @@
         },
         "baselineAdvanced": {
           "type": "boolean"
+        },
+        "baselineDigest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dirtyPaths": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
         }
       }
     }
